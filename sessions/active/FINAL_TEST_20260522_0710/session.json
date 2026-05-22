@@ -1,0 +1,44 @@
+{
+  "session_id": "FINAL_TEST_20260522_0710",
+  "client_label": "FINAL_TEST",
+  "session_status": "REPORT_GENERATED",
+  "created_at": "2026-05-22T07:10:32",
+  "updated_at": "2026-05-22T07:25:26",
+  "files_detected": 1,
+  "targets": [
+    "cms.aptech-worldwide.com",
+    "3.108.93.130"
+  ],
+  "tools_detected": [
+    "NMAP"
+  ],
+  "report_generated": true,
+  "report_path": "C:\\Users\\akars\\Downloads\\IntelliAssess AI\\sessions\\active\\FINAL_TEST_20260522_0710\\reports\\security_report.docx",
+  "archived": false,
+  "context": {
+    "exposure": "public",
+    "environment": "production",
+    "sector": "education",
+    "company_name": null,
+    "asset_owner": null,
+    "scope_notes": null,
+    "infra_notes": null
+  },
+  "compliance_hits": [],
+  "processing_log": [
+    {
+      "event": "file_ingested",
+      "filename": "aptech.txt",
+      "timestamp": "2026-05-22T07:11:28.131947+00:00",
+      "phase": "3-2",
+      "tool_type": "NMAP",
+      "nmap_subtype": "NMAP_TEXT",
+      "confidence": 0.826,
+      "targets_found": 2,
+      "parse_assets": 0,
+      "parse_findings": 0,
+      "parse_errors": 1,
+      "parse_ms": 0.0
+    }
+  ]
+}

@@ -1,0 +1,531 @@
+diff --git a/ai/__init__.py b/ai/__init__.py
+new file mode 100644
+index 0000000..ffddd14
+--- /dev/null
++++ b/ai/__init__.py
+@@ -0,0 +1,5 @@
++"""ai package — optional Gemini enrichment: client, prompt construction, analyzer, AI models.
++
++The entire AI layer is enhancement-only. Every component degrades gracefully
++when Gemini is unavailable (no API key, no SDK, or no network).
++"""
+diff --git a/config/__init__.py b/config/__init__.py
+new file mode 100644
+index 0000000..7c1a3d2
+--- /dev/null
++++ b/config/__init__.py
+@@ -0,0 +1 @@
++"""config package — global settings, constants, lifecycle enums, paths, watcher timing."""
+diff --git a/core/__init__.py b/core/__init__.py
+new file mode 100644
+index 0000000..01219b8
+--- /dev/null
++++ b/core/__init__.py
+@@ -0,0 +1 @@
++"""core package — orchestration: watcher lifecycle, ingest, session management, persistence, metadata."""
+diff --git a/core/session_manager.py b/core/session_manager.py
+index 57890cd..b5948a6 100644
+--- a/core/session_manager.py
++++ b/core/session_manager.py
+@@ -245,7 +245,7 @@ def _aggregate_parsed_data(session_dir: Path) -> list:
+     # parsers at module load time. No circular import risk; avoids loading
+     # the full parse stack for every session_manager import.
+     from intelligence.file_classifier import ToolType, classify_with_subtype
+-    from intelligence.parsers.registry import parse_file
++    from parsers.registry import parse_file
+ 
+     processed_dir = session_dir / "processed"
+     results: list = []
+diff --git a/intelligence/__init__.py b/intelligence/__init__.py
+new file mode 100644
+index 0000000..f219724
+--- /dev/null
++++ b/intelligence/__init__.py
+@@ -0,0 +1 @@
++"""intelligence package — classification, target extraction, contextual risk adjustment, compliance mapping."""
+diff --git a/intelligence/file_classifier.py b/intelligence/file_classifier.py
+index 616f058..c32266e 100644
+--- a/intelligence/file_classifier.py
++++ b/intelligence/file_classifier.py
+@@ -706,9 +706,12 @@ def _read_sample(file_path: Path) -> Optional[str]:
+         return None
+ 
+     try:
+-        return raw.decode("utf-8")
++        text = raw.decode("utf-8")
+     except UnicodeDecodeError:
+-        return raw.decode("latin-1")
++        text = raw.decode("latin-1")
++    # Normalize line endings (CRLF/CR -> LF) so content-based classification is
++    # line-ending agnostic, consistent with the parser and extractor read paths.
++    return text.replace("\r\n", "\n").replace("\r", "\n")
+ 
+ 
+ def list_registered_detectors() -> list[str]:
+diff --git a/intelligence/target_extractor.py b/intelligence/target_extractor.py
+index 15af1ae..b60e328 100644
+--- a/intelligence/target_extractor.py
++++ b/intelligence/target_extractor.py
+@@ -1007,6 +1007,9 @@ def _read_content(file_path: Path) -> Optional[str]:
+         log.error("_read_content: OSError reading %s: %s", file_path, exc)
+         return None
+     try:
+-        return raw.decode("utf-8")
++        text = raw.decode("utf-8")
+     except UnicodeDecodeError:
+-        return raw.decode("latin-1")
++        text = raw.decode("latin-1")
++    # Normalize line endings (CRLF/CR -> LF) so CRLF scan files extract the
++    # same targets as LF files. Line-oriented extractor regexes assume LF.
++    return text.replace("\r\n", "\n").replace("\r", "\n")
+diff --git a/models/__init__.py b/models/__init__.py
+new file mode 100644
+index 0000000..f1c31e3
+--- /dev/null
++++ b/models/__init__.py
+@@ -0,0 +1,6 @@
++"""models package — canonical session lifecycle container (models/session.py).
++
++Note: deterministic parser models live in parsers/models.py and AI enrichment
++models live in ai/models.py. Keeping these boundaries separate is intentional
++(deterministic parsing is authoritative; AI enrichment wraps it).
++"""
+diff --git a/parsers/__init__.py b/parsers/__init__.py
+new file mode 100644
+index 0000000..98d8509
+--- /dev/null
++++ b/parsers/__init__.py
+@@ -0,0 +1,61 @@
++"""
++parsers package — deterministic scan parsing layer.
++
++Importing this package bootstraps the parser registry. Each concrete parser
++module self-registers (via parsers.registry.register) at import time, but
++*something* must import those modules for that to happen. This package __init__
++is that single bootstrap point.
++
++Design rationale:
++  - parsers/registry.py stays intentionally generic — it knows nothing about
++    which concrete parsers exist (its docstring promises "zero changes to
++    registry.py" to add a parser). The knowledge of which parsers to load lives
++    here instead. To add a new tool parser you add one line to _PARSER_MODULES.
++  - Graceful degradation: a parser module that fails to import is logged and
++    skipped rather than crashing the platform. Dispatch for that tool type then
++    falls back to an empty ParsedScanData (see parsers.registry.parse_file),
++    which is the correct bounded-failure behaviour.
++
++Public API re-exported for convenience:
++  parse_file, register, get_parser, list_registered_parsers
++"""
++
++from utils.logger import get_logger
++
++# Generic dispatch API first — no concrete-parser dependencies, so this is
++# always safe to import even if individual parsers later fail to load.
++from parsers.registry import (  # noqa: F401
++    parse_file,
++    register,
++    get_parser,
++    list_registered_parsers,
++)
++
++log = get_logger(__name__)
++
++# Concrete parser bootstrap. Each import triggers the parser's module-level
++# register() call. Explicit `import` statements (not importlib with string
++# names) are used deliberately so PyInstaller's static dependency analysis
++# bundles every parser into the EXE. Each import is isolated in its own
++# try/except so one broken parser cannot disable the others (graceful
++# degradation — dispatch for a missing tool type falls back to empty results).
++
++try:
++    from parsers import nmap_parser  # noqa: F401  (registers NmapParser)
++except Exception as exc:  # pragma: no cover - defensive bootstrap guard
++    log.error("parsers: failed to load nmap_parser — NMAP dispatch will fall "
++              "back to empty results. Cause: %s", exc, exc_info=True)
++
++try:
++    from parsers import httpx_parser  # noqa: F401  (registers HttpxParser)
++except Exception as exc:  # pragma: no cover - defensive bootstrap guard
++    log.error("parsers: failed to load httpx_parser — HTTPX dispatch will fall "
++              "back to empty results. Cause: %s", exc, exc_info=True)
++
++try:
++    from parsers import sslscan_parser  # noqa: F401  (registers SslscanParser)
++except Exception as exc:  # pragma: no cover - defensive bootstrap guard
++    log.error("parsers: failed to load sslscan_parser — SSLSCAN dispatch will "
++              "fall back to empty results. Cause: %s", exc, exc_info=True)
++
++log.debug("parsers package initialized — registered: %s", list_registered_parsers())
+diff --git a/parsers/base.py b/parsers/base.py
+index e00f29b..c44d736 100644
+--- a/parsers/base.py
++++ b/parsers/base.py
+@@ -44,7 +44,7 @@ from pathlib import Path
+ from typing import Optional
+ 
+ from intelligence.file_classifier import NmapSubtype, ToolType
+-from models.models import ParsedAsset, ParsedFinding, ParsedService
++from parsers.models import ParsedAsset, ParsedFinding, ParsedService
+ from utils.logger import get_logger
+ 
+ log = get_logger(__name__)
+@@ -305,9 +305,13 @@ class BaseParser(ABC):
+             log.error("%sParser._read_content: OSError: %s — %s", self.tool_type.value, file_path, exc)
+             return None
+         try:
+-            return raw.decode("utf-8")
++            text = raw.decode("utf-8")
+         except UnicodeDecodeError:
+-            return raw.decode("latin-1")
++            text = raw.decode("latin-1")
++        # Normalize line endings (CRLF/CR -> LF), consistent with the registry
++        # dispatch read path, so multi-pass parsers that re-read are unaffected
++        # by Windows-style line endings.
++        return text.replace("\r\n", "\n").replace("\r", "\n")
+ 
+     def __repr__(self) -> str:
+         return f"{self.__class__.__name__}(tool_type={self.tool_type!r})"
+diff --git a/parsers/httpx_parser.py b/parsers/httpx_parser.py
+index 53a95d5..4d0cb16 100644
+--- a/parsers/httpx_parser.py
++++ b/parsers/httpx_parser.py
+@@ -53,9 +53,9 @@ from typing import Optional
+ from urllib.parse import urlparse
+ 
+ from intelligence.file_classifier import NmapSubtype, ToolType
+-from intelligence.parsers.base import BaseParser, ParsedScanData
+-from intelligence.parsers.models import ParsedAsset, ParsedFinding, ParsedService
+-from intelligence.parsers.registry import register
++from parsers.base import BaseParser, ParsedScanData
++from parsers.models import ParsedAsset, ParsedFinding, ParsedService
++from parsers.registry import register
+ from utils.logger import get_logger
+ 
+ log = get_logger(__name__)
+diff --git a/parsers/models.py b/parsers/models.py
+new file mode 100644
+index 0000000..a87bcb4
+--- /dev/null
++++ b/parsers/models.py
+@@ -0,0 +1,188 @@
++"""
++parsers/models.py
++=================
++Deterministic parser data models — the canonical typed containers produced
++by the parser layer.
++
++Responsibility: define the shapes that every concrete parser (NmapParser,
++HttpxParser, SslscanParser, ...) populates and that ParsedScanData (parsers/base.py)
++aggregates. These are DETERMINISTIC extraction containers — they carry only
++what was literally observed in a scan artifact.
++
++Design principles:
++  - Pure typed dataclasses — zero business logic, zero severity scoring,
++    zero CVE lookup, zero AI calls. Scoring/enrichment is the analyzer's job.
++  - Every field has a safe default (except identity fields) so a parser can
++    populate only what its tool's output actually provides.
++  - All fields are JSON-serializable; to_dict() drives ParsedScanData.to_dict()
++    and ultimately session.json persistence of parsed evidence.
++
++Relationship to other model layers:
++  parsers/models.py  → ParsedAsset / ParsedFinding / ParsedService (THIS module)
++                        deterministic extraction (authoritative)
++  ai/models.py       → AIFindingSummary / AIRemediation / AIExecutiveSummary /
++                        EnrichedReport — narrative enrichment that WRAPS, never
++                        replaces, the deterministic findings below.
++  models/session.py  → Session lifecycle/state container.
++
++These models are NOT AI models. AI enrichment augments them; it does not
++substitute for them. Keep this boundary clean.
++
++Used by:
++  parsers/base.py        — ParsedScanData aggregates assets + findings
++  parsers/nmap_parser.py — constructs ParsedAsset/ParsedService/ParsedFinding
++  parsers/httpx_parser.py
++  parsers/sslscan_parser.py
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from typing import Optional
++
++
++# ---------------------------------------------------------------------------
++# ParsedService — a single observed service/port on an asset
++# ---------------------------------------------------------------------------
++
++@dataclass
++class ParsedService:
++    """
++    One service observed on a host/endpoint.
++
++    port         : int            — the port number (e.g. 443)
++    protocol     : str            — transport protocol, lower-case (e.g. "tcp")
++    state        : str            — port state, lower-case (e.g. "open", "filtered")
++    service_name : str            — service label from the tool (e.g. "https", "ssh")
++    version      : Optional[str]  — product/version banner string when available
++                                    (e.g. "nginx 1.24.0"); None when not reported.
++    extra_info   : str            — raw evidence line or any tool-specific extra
++                                    detail preserved verbatim for traceability.
++    """
++    port:          int
++    protocol:      str            = "tcp"
++    state:         str            = "open"
++    service_name:  str            = ""
++    version:       Optional[str]  = None
++    extra_info:    str            = ""
++
++    def to_dict(self) -> dict:
++        return {
++            "port":         self.port,
++            "protocol":     self.protocol,
++            "state":        self.state,
++            "service_name": self.service_name,
++            "version":      self.version,
++            "extra_info":   self.extra_info,
++        }
++
++
++# ---------------------------------------------------------------------------
++# ParsedAsset — a host/endpoint discovered in a scan artifact
++# ---------------------------------------------------------------------------
++
++@dataclass
++class ParsedAsset:
++    """
++    A single asset (host or endpoint) extracted from a scan output.
++
++    value         : str                   — primary identifier (hostname or IP)
++                                            chosen by the parser for readability.
++    asset_type    : str                   — "hostname" | "ipv4" | "ipv6" | "unknown"
++    ip_addresses  : list[str]             — resolved/observed IPs (excludes `value`
++                                            when value is itself the primary form).
++    hostnames     : list[str]             — additional hostnames / rDNS aliases.
++    services      : list[ParsedService]   — services observed on this asset.
++    hosting_hint  : Optional[str]         — best-effort hint about hosting/stack
++                                            (e.g. a webserver banner). Display only.
++    os_name       : str                   — best-guess operating system, when the
++                                            tool reports OS detection (Nmap -O).
++                                            Empty string when unknown.
++    os_confidence : str                   — qualitative confidence for os_name
++                                            ("high" | "medium" | "low" | "").
++    scan_metadata : dict                  — tool-specific extras not covered above
++                                            (e.g. httpx url/title/tech, sslscan SNI).
++
++    Convenience:
++      open_ports — sorted list of ports whose service state contains "open".
++    """
++    value:         str
++    asset_type:    str                  = "unknown"
++    ip_addresses:  list[str]            = field(default_factory=list)
++    hostnames:     list[str]            = field(default_factory=list)
++    services:      list[ParsedService]  = field(default_factory=list)
++    hosting_hint:  Optional[str]        = None
++    os_name:       str                  = ""
++    os_confidence: str                  = ""
++    scan_metadata: dict                 = field(default_factory=dict)
++
++    @property
++    def open_ports(self) -> list[int]:
++        ports: list[int] = []
++        for svc in self.services:
++            if "open" in (svc.state or "").lower() and svc.port not in ports:
++                ports.append(svc.port)
++        return sorted(ports)
++
++    def to_dict(self) -> dict:
++        return {
++            "value":         self.value,
++            "asset_type":    self.asset_type,
++            "ip_addresses":  self.ip_addresses,
++            "hostnames":     self.hostnames,
++            "services":      [s.to_dict() for s in self.services],
++            "hosting_hint":  self.hosting_hint,
++            "os_name":       self.os_name,
++            "os_confidence": self.os_confidence,
++            "scan_metadata": self.scan_metadata,
++        }
++
++
++# ---------------------------------------------------------------------------
++# ParsedFinding — one deterministic security observation
++# ---------------------------------------------------------------------------
++
++@dataclass
++class ParsedFinding:
++    """
++    A single deterministic security observation produced by a parser.
++
++    This is raw, factual evidence — NOT an analyzed/scored finding. The
++    severity_hint is the parser's first-pass guess; the analysis layer may
++    adjust it. AI enrichment wraps this object (see ai/models.AIFindingSummary)
++    and never replaces it.
++
++    finding_type  : str            — stable machine key (e.g. "VERSION_DISCLOSURE",
++                                      "WEAK_TLS_VERSION", "HIGH_RISK_PORT"). Used
++                                      for correlation, dedup, and remediation lookup.
++    target        : str            — the asset this finding applies to (host/IP/URL).
++    port          : Optional[int]  — associated port when applicable; None otherwise.
++    protocol      : str            — transport protocol when applicable (e.g. "tcp").
++    service       : str            — service label when applicable (e.g. "https").
++    detail        : str            — human-readable description of the observation.
++    severity_hint : str            — CRITICAL|HIGH|MEDIUM|LOW|INFO (first-pass).
++    raw_evidence  : str            — verbatim line/snippet supporting the finding.
++    source_tool   : str            — ToolType.value of the producing parser.
++    """
++    finding_type:  str
++    target:        str
++    port:          Optional[int]  = None
++    protocol:      str            = ""
++    service:       str            = ""
++    detail:        str            = ""
++    severity_hint: str            = "INFO"
++    raw_evidence:  str            = ""
++    source_tool:   str            = ""
++
++    def to_dict(self) -> dict:
++        return {
++            "finding_type":  self.finding_type,
++            "target":        self.target,
++            "port":          self.port,
++            "protocol":      self.protocol,
++            "service":       self.service,
++            "detail":        self.detail,
++            "severity_hint": self.severity_hint,
++            "raw_evidence":  self.raw_evidence,
++            "source_tool":   self.source_tool,
++        }
+diff --git a/parsers/nmap_parser.py b/parsers/nmap_parser.py
+index 84da3ee..f193883 100644
+--- a/parsers/nmap_parser.py
++++ b/parsers/nmap_parser.py
+@@ -47,9 +47,9 @@ from pathlib import Path
+ from typing import Optional
+ 
+ from intelligence.file_classifier import NmapSubtype, ToolType
+-from intelligence.parsers.base import BaseParser, ParsedScanData
+-from intelligence.parsers.models import ParsedAsset, ParsedFinding, ParsedService
+-from intelligence.parsers.registry import register
++from parsers.base import BaseParser, ParsedScanData
++from parsers.models import ParsedAsset, ParsedFinding, ParsedService
++from parsers.registry import register
+ from utils.logger import get_logger
+ 
+ log = get_logger(__name__)
+diff --git a/parsers/registry.py b/parsers/registry.py
+index 730e356..fc32737 100644
+--- a/parsers/registry.py
++++ b/parsers/registry.py
+@@ -278,6 +278,10 @@ def _read_content(file_path: Path) -> Optional[str]:
+         log.error("_read_content: OSError reading %s: %s", file_path, exc)
+         return None
+     try:
+-        return raw.decode("utf-8")
++        text = raw.decode("utf-8")
+     except UnicodeDecodeError:
+-        return raw.decode("latin-1")
++        text = raw.decode("latin-1")
++    # Normalize line endings (CRLF/CR -> LF). Windows-generated scan files use
++    # CRLF; line-oriented parser regexes assume LF, so without this a CRLF file
++    # silently parses to zero results. Single-point defensive normalization.
++    return text.replace("\r\n", "\n").replace("\r", "\n")
+diff --git a/parsers/sslscan_parser.py b/parsers/sslscan_parser.py
+index 2455b92..346783b 100644
+--- a/parsers/sslscan_parser.py
++++ b/parsers/sslscan_parser.py
+@@ -55,9 +55,9 @@ from pathlib import Path
+ from typing import Optional
+ 
+ from intelligence.file_classifier import NmapSubtype, ToolType
+-from intelligence.parsers.base import BaseParser, ParsedScanData
+-from intelligence.parsers.models import ParsedAsset, ParsedFinding, ParsedService
+-from intelligence.parsers.registry import register
++from parsers.base import BaseParser, ParsedScanData
++from parsers.models import ParsedAsset, ParsedFinding, ParsedService
++from parsers.registry import register
+ from utils.logger import get_logger
+ 
+ log = get_logger(__name__)
+diff --git a/reporting/__init__.py b/reporting/__init__.py
+new file mode 100644
+index 0000000..35570ad
+--- /dev/null
++++ b/reporting/__init__.py
+@@ -0,0 +1,15 @@
++"""
++reporting package — enterprise DOCX report generation layer.
++
++Exposes the single stable entry point generate_docx() so callers use
++`from reporting import generate_docx` without coupling to the internal module
++layout (reporting/reporter.py). This is the mission-critical output path; it is
++designed to never raise (see reporter.generate_docx).
++
++reporter_old_backup.py is retained in this package as a legacy reference only.
++It is NOT imported anywhere and is not part of the active reporting pipeline.
++"""
++
++from reporting.reporter import generate_docx  # noqa: F401
++
++__all__ = ["generate_docx"]
+diff --git a/reporting/reporter.py b/reporting/reporter.py
+index ce91878..655d961 100644
+--- a/reporting/reporter.py
++++ b/reporting/reporter.py
+@@ -888,8 +888,16 @@ class DocxReporter:
+         cert            = ssl_info.get("certificate", {}) or {}
+ 
+         # ── Protocol support summary ───────────────────────────────────────
+-        enabled_protos  = [p["name"] for p in protocols if p.get("enabled")]
+-        disabled_protos = [p["name"] for p in protocols if not p.get("enabled")]
++        # Protocol dicts are produced by the SSLScan parser. Accept either the
++        # "name" or "protocol" key defensively so a parser dict-shape change can
++        # never crash the mission-critical report. Skip entries with no label.
++        def _proto_label(p: dict) -> str:
++            return (p.get("name") or p.get("protocol") or "").strip()
++
++        enabled_protos  = [lbl for p in protocols
++                           if p.get("enabled") and (lbl := _proto_label(p))]
++        disabled_protos = [lbl for p in protocols
++                           if not p.get("enabled") and (lbl := _proto_label(p))]
+ 
+         if enabled_protos or disabled_protos:
+             T.add_label_paragraph(doc, "Protocol Support")
+diff --git a/ui/__init__.py b/ui/__init__.py
+new file mode 100644
+index 0000000..53ac940
+--- /dev/null
++++ b/ui/__init__.py
+@@ -0,0 +1 @@
++"""ui package — console menu system, session rendering, operator interaction."""
+diff --git a/ui/menu.py b/ui/menu.py
+index 1f5f624..102a908 100644
+--- a/ui/menu.py
++++ b/ui/menu.py
+@@ -265,6 +265,18 @@ def run_session_action_menu(session: Session, session_dir: Path) -> None:
+     Phase 5 extension point: add option to view generated report path.
+     """
+     while True:
++        # Refresh from disk each iteration. The watcher ingests files on
++        # background worker threads and persists session.json via session_storage
++        # (atomic tmp+rename write). The `session` passed in is a point-in-time
++        # snapshot from create/resume time, so we re-read the single source of
++        # truth before rendering or acting — otherwise the header and detail view
++        # show stale counts (Files: 0) and completion would persist the stale
++        # snapshot, clobbering the watcher's on-disk updates. On a rare load miss
++        # we keep the previous snapshot rather than failing.
++        refreshed = storage.load(session_dir)
++        if refreshed is not None:
++            session = refreshed
++
+         views.render_session_action_header(session)
+         print("  1.  Mark session complete & generate report")
+         print("  2.  View session details")
+diff --git a/utils/__init__.py b/utils/__init__.py
+new file mode 100644
+index 0000000..bc99cee
+--- /dev/null
++++ b/utils/__init__.py
+@@ -0,0 +1 @@
++"""utils package — logging, filesystem helpers, shared utilities."""
