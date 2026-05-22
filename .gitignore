@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+logs/
+sessions/
+
+desktop.ini
+.DS_Store
+
+*.diff
+*.patch
+
+.env
