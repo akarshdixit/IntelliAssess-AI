@@ -1,29 +1,34 @@
 """
 ai/models.py
-=============
-Typed data containers for Gemini AI enrichment output — Phase 4-1.
+============
+Structured data models for the AI enrichment layer of IntelliAssess AI.
 
-Responsibility: define the canonical shapes for enriched AI output.
-These are the objects that flow FROM the AI layer INTO the report generator (Phase 4-2).
+Responsibility: define the typed containers that ai/analyzer.py produces and
+reporting/reporter.py consumes. These are pure dataclasses — zero I/O, zero
+network, zero business logic — mirroring the design discipline of
+parsers/models.py.
 
-Design principles:
-  - Pure typed dataclasses — zero business logic.
-  - All fields are JSON-serializable.
-  - Optional fields with safe defaults so partial enrichment is valid.
-  - `enriched` flag on every container: False = Gemini unavailable or failed,
-    report generator falls back to raw ParsedFinding.detail in that case.
-  - These are ENRICHMENT containers, not finding containers. They wrap and
-    augment ParsedFinding — they do not replace it.
+Architecture position:
+  parsers → ParsedScanData → analyzer.run() → EnrichedReport → reporter
 
-Relationship to parser models:
-  ParsedFinding (parsers/models.py) → deterministic extraction
-  AIFindingSummary                  → narrative enrichment of one finding
-  AIExecutiveSummary                → cross-finding synthesis for exec audience
-  AIRemediation                     → prioritized remediation guidance
+Phase 1C (semantic propagation) note:
+  AIFindingSummary gained FIVE additive, safe-defaulted deterministic fields —
+  finding_id, title, remediation, compliance_refs, confidence — so that the
+  authoritative metadata attached by intelligence/finding_catalog.build_finding()
+  survives intact through the analyzer and into the reporter. Previously the
+  analyzer flattened findings into a minimal dict and the reporter was forced to
+  reconstruct generic titles and boilerplate remediation. These fields are the
+  carriers that let the reporter render the deterministic catalog's title,
+  remediation, and compliance references directly — with full quality even when
+  Gemini is unavailable. The additions are backward-compatible: every prior
+  field is unchanged and every new field defaults to an empty value, so any code
+  not yet wired to consume them is unaffected.
 
-Used by:
-  ai/analyzer.py      — produces these from Gemini responses
-  reporting/reporter.py — consumes these for DOCX section building
+  AI enrichment remains strictly additive: Gemini populates analyst_narrative,
+  business_impact, and the AIRemediation action lists. It never overwrites the
+  deterministic finding_id / title / remediation / compliance_refs, and (as of
+  Phase 1C) it no longer overrides the deterministic severity either — the
+  catalog severity is authoritative; any AI-suggested severity is advisory only.
 """
 
 from __future__ import annotations
@@ -33,183 +38,141 @@ from typing import Optional
 
 
 # ---------------------------------------------------------------------------
-# AIFindingSummary — enriched narrative for a single ParsedFinding
+# AIFindingSummary
 # ---------------------------------------------------------------------------
 
 @dataclass
 class AIFindingSummary:
     """
-    AI-generated narrative enrichment for one ParsedFinding.
+    One finding, carrying both deterministic catalog metadata (authoritative)
+    and optional AI-generated narrative (enhancement).
 
-    Wraps a single finding with analyst-quality prose that the report
-    generator uses in the Technical Findings section of the DOCX report.
+    Deterministic fields (from intelligence/finding_catalog.build_finding):
+        finding_id, title, remediation, compliance_refs, confidence,
+        severity_label (sourced from the catalog severity), raw_finding_detail.
 
-    finding_type       : str           — mirrors ParsedFinding.finding_type
-    target             : str           — mirrors ParsedFinding.target
-    port               : Optional[int] — mirrors ParsedFinding.port
-    analyst_narrative  : str           — human-readable analyst explanation.
-    business_impact    : str           — non-technical business risk statement.
-    severity_label     : str           — CRITICAL|HIGH|MEDIUM|LOW|INFO
-    enriched           : bool          — True if Gemini produced this; False = fallback.
-    raw_finding_detail : str           — original ParsedFinding.detail for fallback.
+    AI-enhancement fields (populated only when enriched=True):
+        analyst_narrative, business_impact.
+
+    The reporter prefers deterministic fields and treats AI text as an overlay,
+    so an unenriched (offline) summary still renders a complete, professional
+    finding.
     """
     finding_type:       str
     target:             str
-    port:               Optional[int]  = None
-    analyst_narrative:  str            = ""
-    business_impact:    str            = ""
-    severity_label:     str            = "INFO"
-    enriched:           bool           = False
-    raw_finding_detail: str            = ""
+    port:               Optional[int]      = None
 
-    def to_dict(self) -> dict:
-        return {
-            "finding_type":       self.finding_type,
-            "target":             self.target,
-            "port":               self.port,
-            "analyst_narrative":  self.analyst_narrative,
-            "business_impact":    self.business_impact,
-            "severity_label":     self.severity_label,
-            "enriched":           self.enriched,
-            "raw_finding_detail": self.raw_finding_detail,
-        }
+    # ── AI enhancement (optional) ──────────────────────────────────────────
+    analyst_narrative:  str                = ""
+    business_impact:    str                = ""
+    enriched:           bool               = False
+
+    # ── Deterministic carry-through (authoritative) ────────────────────────
+    severity_label:     str                = "INFO"
+    raw_finding_detail: str                = ""
+    finding_id:         str                = ""
+    title:              str                = ""
+    remediation:        str                = ""
+    compliance_refs:    dict               = field(default_factory=dict)
+    confidence:         float              = 1.0
 
 
 # ---------------------------------------------------------------------------
-# AIRemediation — prioritized remediation guidance for a finding type
+# AIRemediation
 # ---------------------------------------------------------------------------
 
 @dataclass
 class AIRemediation:
     """
-    AI-generated remediation guidance for a finding type.
+    Structured AI-generated remediation guidance for one finding_type.
 
-    finding_type       : str        — finding this remediation applies to
-    target             : str        — target this was generated for
-    immediate_actions  : list[str]  — steps to take within 24-72 hours
-    short_term_actions : list[str]  — steps for the next sprint/release cycle
-    commands           : list[str]  — copy-paste technical commands/configs
-    references         : list[str]  — relevant standards/docs referenced
-    enriched           : bool       — False = Gemini unavailable; use fallback
+    This is purely an enhancement layer. When enriched=False (offline / failed
+    enrichment) every list is empty and the reporter falls back to the
+    deterministic per-finding remediation carried on AIFindingSummary.remediation.
     """
-    finding_type:       str
-    target:             str
-    immediate_actions:  list[str]   = field(default_factory=list)
-    short_term_actions: list[str]   = field(default_factory=list)
-    commands:           list[str]   = field(default_factory=list)
-    references:         list[str]   = field(default_factory=list)
-    enriched:           bool        = False
-
-    def to_dict(self) -> dict:
-        return {
-            "finding_type":       self.finding_type,
-            "target":             self.target,
-            "immediate_actions":  self.immediate_actions,
-            "short_term_actions": self.short_term_actions,
-            "commands":           self.commands,
-            "references":         self.references,
-            "enriched":           self.enriched,
-        }
+    finding_type:        str
+    target:              str        = ""
+    immediate_actions:   list[str]  = field(default_factory=list)
+    short_term_actions:  list[str]  = field(default_factory=list)
+    commands:            list[str]  = field(default_factory=list)
+    references:          list[str]  = field(default_factory=list)
+    enriched:            bool       = False
 
 
 # ---------------------------------------------------------------------------
-# AIExecutiveSummary — cross-finding synthesis for the executive audience
+# AIExecutiveSummary
 # ---------------------------------------------------------------------------
 
 @dataclass
 class AIExecutiveSummary:
     """
-    AI-generated executive summary synthesizing all findings for a session.
+    The executive summary block.
 
-    overview_paragraph      : str       — 2-4 sentence assessment overview.
-    risk_posture            : str       — CRITICAL|HIGH|MEDIUM|LOW|POSITIVE|UNKNOWN
-    key_findings            : list[str] — 3-5 bullet-ready key findings.
-    positive_observations   : list[str] — security controls working correctly.
-    priority_recommendation : str       — single most important action.
-    enriched                : bool      — False = Gemini unavailable; use fallback.
-    targets_assessed        : list[str] — list of target hostnames/IPs covered
-    total_findings          : int       — total finding count across all parsed data
+    When enriched=True it carries an AI-written overview paragraph and key
+    findings. When enriched=False the reporter renders a structured data-table
+    summary instead, driven by risk_posture / total_findings / positive
+    observations — all of which are computed deterministically.
     """
-    overview_paragraph:       str        = ""
-    risk_posture:             str        = "UNKNOWN"
-    key_findings:             list[str]  = field(default_factory=list)
-    positive_observations:    list[str]  = field(default_factory=list)
-    priority_recommendation:  str        = ""
-    enriched:                 bool       = False
-    targets_assessed:         list[str]  = field(default_factory=list)
-    total_findings:           int        = 0
-
-    def to_dict(self) -> dict:
-        return {
-            "overview_paragraph":      self.overview_paragraph,
-            "risk_posture":            self.risk_posture,
-            "key_findings":            self.key_findings,
-            "positive_observations":   self.positive_observations,
-            "priority_recommendation": self.priority_recommendation,
-            "enriched":                self.enriched,
-            "targets_assessed":        self.targets_assessed,
-            "total_findings":          self.total_findings,
-        }
+    overview_paragraph:      str        = ""
+    risk_posture:            str        = "UNKNOWN"
+    key_findings:            list[str]  = field(default_factory=list)
+    positive_observations:   list[str]  = field(default_factory=list)
+    priority_recommendation: str        = ""
+    enriched:                bool       = False
+    targets_assessed:        list[str]  = field(default_factory=list)
+    total_findings:          int        = 0
 
 
 # ---------------------------------------------------------------------------
-# EnrichedReport — top-level container passed to reporter.py
+# EnrichedReport
 # ---------------------------------------------------------------------------
 
 @dataclass
 class EnrichedReport:
     """
-    Top-level enrichment container for a complete assessment session.
+    The complete enriched assessment, returned by analyzer.run() and consumed
+    by reporting/reporter.generate_docx().
 
-    This is the single object that reporting/reporter.py consumes.
-
-    executive_summary   : AIExecutiveSummary
-    finding_summaries   : list[AIFindingSummary]  — one per notable finding
-    remediations        : list[AIRemediation]      — one per finding type
-    session_context     : dict                     — exposure, environment, sector
-    enrichment_complete : bool  — True if all Gemini calls succeeded.
-    enrichment_errors   : list[str]  — error messages from failed Gemini calls
-    primary_targets     : list[str]  — deduplicated targets across all parsed data
+    Always valid: analyzer.run() guarantees a fully-populated EnrichedReport
+    even when Gemini is entirely unavailable (every enriched flag False, but all
+    deterministic data present).
     """
-    executive_summary:    AIExecutiveSummary
-    finding_summaries:    list[AIFindingSummary] = field(default_factory=list)
-    remediations:         list[AIRemediation]    = field(default_factory=list)
-    session_context:      dict                   = field(default_factory=dict)
-    enrichment_complete:  bool                   = False
-    enrichment_errors:    list[str]              = field(default_factory=list)
-    primary_targets:      list[str]              = field(default_factory=list)
-
-    @property
-    def has_errors(self) -> bool:
-        return len(self.enrichment_errors) > 0
+    executive_summary:   AIExecutiveSummary
+    finding_summaries:   list[AIFindingSummary] = field(default_factory=list)
+    remediations:        list[AIRemediation]    = field(default_factory=list)
+    session_context:     dict                   = field(default_factory=dict)
+    enrichment_complete: bool                   = False
+    enrichment_errors:   list[str]              = field(default_factory=list)
+    primary_targets:     list[str]              = field(default_factory=list)
 
     @property
     def finding_count(self) -> int:
+        """Total number of finding summaries in the report."""
         return len(self.finding_summaries)
 
     def get_remediation(self, finding_type: str) -> Optional[AIRemediation]:
-        """Look up remediation by finding_type. Returns None if not found."""
+        """
+        Return the AIRemediation for a given finding_type, or None if no
+        type-level remediation was produced (e.g. offline mode).
+
+        Remediation is generated once per finding_type by the analyzer, so the
+        first match is authoritative.
+        """
         for r in self.remediations:
-            if r.finding_type == finding_type:
+            if getattr(r, "finding_type", None) == finding_type:
                 return r
         return None
 
-    def to_dict(self) -> dict:
-        return {
-            "executive_summary":   self.executive_summary.to_dict(),
-            "finding_summaries":   [f.to_dict() for f in self.finding_summaries],
-            "remediations":        [r.to_dict() for r in self.remediations],
-            "session_context":     self.session_context,
-            "enrichment_complete": self.enrichment_complete,
-            "enrichment_errors":   self.enrichment_errors,
-            "primary_targets":     self.primary_targets,
-        }
-
     def summary(self) -> str:
-        """One-line summary for logging."""
+        """One-line diagnostic summary for logging."""
+        enriched_findings = sum(
+            1 for f in self.finding_summaries if getattr(f, "enriched", False)
+        )
         return (
-            f"EnrichedReport: targets={len(self.primary_targets)} "
-            f"findings={self.finding_count} "
-            f"enriched={self.enrichment_complete} "
-            f"errors={len(self.enrichment_errors)}"
+            f"EnrichedReport(findings={self.finding_count}, "
+            f"enriched={enriched_findings}, "
+            f"remediations={len(self.remediations)}, "
+            f"targets={len(self.primary_targets)}, "
+            f"complete={self.enrichment_complete}, "
+            f"errors={len(self.enrichment_errors)})"
         )

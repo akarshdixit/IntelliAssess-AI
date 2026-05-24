@@ -16,14 +16,21 @@ Supported formats:
                                data available; header-dependent findings
                                are suppressed on this path.
 
-Finding types generated (deterministic, header/scheme driven):
-  HTTP_ONLY                    — target URL uses http:// scheme
-  VERSION_DISCLOSURE           — Server header exposes product + version string
-  MISSING_HSTS                 — HTTPS target lacks Strict-Transport-Security
-  MISSING_CSP                  — Content-Security-Policy header absent
-  MISSING_X_FRAME_OPTIONS      — X-Frame-Options header absent
-  MISSING_REFERRER_POLICY      — Referrer-Policy header absent
-  MISSING_X_CONTENT_TYPE_OPTIONS — X-Content-Type-Options header absent
+Finding types generated (deterministic, header/scheme driven). Phase 1B-A:
+all findings are built through the centralized finding catalog
+(intelligence/finding_catalog.build_finding) — this parser no longer
+hand-rolls ParsedFinding objects or invents finding_type strings. It observes
+evidence and asks the catalog to build the finding, so every web finding
+shares the platform-wide schema (finding_id, title, severity, description,
+remediation, compliance refs):
+  HTTP_ONLY                       — target URL uses http:// scheme
+  VERSION_DISCLOSURE              — Server header exposes product + version
+  MISSING_HSTS                    — HTTPS target lacks Strict-Transport-Security
+  MISSING_CSP                     — Content-Security-Policy header absent
+  MISSING_X_FRAME_OPTIONS         — X-Frame-Options header absent
+  MISSING_X_CONTENT_TYPE_OPTIONS  — X-Content-Type-Options header absent
+  MISSING_REFERRER_POLICY         — Referrer-Policy header absent
+  MISSING_PERMISSIONS_POLICY      — Permissions-Policy header absent
 
 Intentionally NOT in this phase:
   - CVE correlation             (Phase 4 — cve_enricher.py)
@@ -53,6 +60,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from intelligence.file_classifier import NmapSubtype, ToolType
+from intelligence.finding_catalog import build_finding
 from parsers.base import BaseParser, ParsedScanData
 from parsers.models import ParsedAsset, ParsedFinding, ParsedService
 from parsers.registry import register
@@ -72,8 +80,9 @@ _SECURITY_HEADERS: list[tuple[str, str, str, str]] = [
     ("strict-transport-security",  "MISSING_HSTS",                     "MEDIUM", "https_only"),
     ("content-security-policy",    "MISSING_CSP",                      "MEDIUM", "any"),
     ("x-frame-options",            "MISSING_X_FRAME_OPTIONS",          "MEDIUM", "any"),
-    ("referrer-policy",            "MISSING_REFERRER_POLICY",          "LOW",    "any"),
     ("x-content-type-options",     "MISSING_X_CONTENT_TYPE_OPTIONS",   "LOW",    "any"),
+    ("referrer-policy",            "MISSING_REFERRER_POLICY",          "LOW",    "any"),
+    ("permissions-policy",         "MISSING_PERMISSIONS_POLICY",       "LOW",    "any"),
 ]
 
 # Regex: detect version-bearing Server header values.
@@ -368,70 +377,69 @@ class HttpxParser(BaseParser):
         """
         Generate deterministic ParsedFinding entries from a JSONL object.
 
+        Phase 1B-A: every finding is built through the centralized finding
+        catalog (intelligence/finding_catalog.build_finding). This parser
+        decides WHICH finding types apply and supplies observed evidence; the
+        catalog supplies the stable id, title, severity, technical description,
+        remediation, and compliance references.
+
         Finding generation order (each is independent):
           1. HTTP_ONLY            — scheme is http://
-          2. VERSION_DISCLOSURE   — Server header exposes version
+          2. VERSION_DISCLOSURE   — Server header exposes a product/version
           3. Security headers     — iterate _SECURITY_HEADERS table
         """
         findings: list[ParsedFinding] = []
+        src       = self.tool_type.value
 
-        scheme    = (urlparse(url).scheme or "").lower()
-        webserver = obj.get("webserver", "") or ""
-        headers   = obj.get("header", {}) or {}
+        parsed_url = urlparse(url)
+        scheme     = (parsed_url.scheme or "").lower()
+        webserver  = obj.get("webserver", "") or ""
+        headers    = obj.get("header", {}) or {}
+
+        # Resolve the observed port: explicit JSON field → URL port → default.
+        port_raw = obj.get("port") or parsed_url.port
+        try:
+            port = int(port_raw) if port_raw else (443 if scheme == "https" else 80)
+        except (TypeError, ValueError):
+            port = 443 if scheme == "https" else 80
+
+        service = service_name_for_scheme(scheme)
 
         # Normalize header keys for consistent lookup
         headers_lc = {k.lower(): v for k, v in headers.items()} if isinstance(headers, dict) else {}
 
         # ── 1. HTTP_ONLY ──────────────────────────────────────────────────
         if scheme == "http":
-            findings.append(ParsedFinding(
-                finding_type=  "HTTP_ONLY",
-                target=        target,
-                port=          80,
-                protocol=      "tcp",
-                service=       "http",
-                detail=        f"Target served over unencrypted HTTP: {url}",
-                severity_hint= "MEDIUM",
-                raw_evidence=  url,
-                source_tool=   self.tool_type.value,
+            findings.append(build_finding(
+                "HTTP_ONLY",
+                target, port=port, protocol="tcp", service="http",
+                evidence=url, source_tool=src,
             ))
 
         # ── 2. VERSION_DISCLOSURE ─────────────────────────────────────────
-        # Triggered when Server header contains a product/version string.
-        # Plain version string from webserver field (already extracted by Httpx).
-        if webserver:
-            vm = _SERVER_VERSION_RE.match(webserver)
-            if vm:
-                findings.append(ParsedFinding(
-                    finding_type=  "VERSION_DISCLOSURE",
-                    target=        target,
-                    port=          443 if scheme == "https" else 80,
-                    protocol=      "tcp",
-                    service=       "http",
-                    detail=        f"Server header discloses version: {webserver}",
-                    severity_hint= "LOW",
-                    raw_evidence=  f"Server: {webserver}",
-                    source_tool=   self.tool_type.value,
-                ))
+        # Triggered only when the Server header carries a product/version
+        # string (e.g. "nginx/1.24.0"); bare product names are not flagged.
+        if webserver and _SERVER_VERSION_RE.match(webserver):
+            findings.append(build_finding(
+                "VERSION_DISCLOSURE",
+                target, port=port, protocol="tcp", service=service,
+                version=webserver, evidence=f"Server: {webserver}",
+                source_tool=src,
+            ))
 
-        # ── 3. Security headers (JSONL path only — headers available) ────
+        # ── 3. Security headers (JSONL path only — headers available) ─────
         # Only run when we actually have header data to inspect.
         if headers_lc:
             for header_name, finding_type, severity, scope in _SECURITY_HEADERS:
-                # Scope guard: HSTS is only relevant on HTTPS targets
+                # Scope guard: HSTS is only meaningful on HTTPS targets.
                 if scope == "https_only" and scheme != "https":
                     continue
                 if header_name not in headers_lc:
-                    findings.append(ParsedFinding(
-                        finding_type=  finding_type,
-                        target=        target,
-                        port=          443 if scheme == "https" else 80,
-                        protocol=      "tcp",
-                        service=       service_name_for_scheme(scheme),
-                        detail=        f"Missing security header: {header_name}",
-                        severity_hint= severity,
-                        raw_evidence=  f"Header absent: {header_name}",
-                        source_tool=   self.tool_type.value,
+                    findings.append(build_finding(
+                        finding_type,
+                        target, port=port, protocol="tcp", service=service,
+                        evidence=f"Response header absent: {header_name}",
+                        source_tool=src, severity=severity,
                     ))
 
         return findings
@@ -509,16 +517,10 @@ class HttpxParser(BaseParser):
 
             # Plain-text path: HTTP_ONLY finding only (no header data available)
             if scheme == "http":
-                result.findings.append(ParsedFinding(
-                    finding_type=  "HTTP_ONLY",
-                    target=        hostname,
-                    port=          port,
-                    protocol=      "tcp",
-                    service=       "http",
-                    detail=        f"Target served over unencrypted HTTP: {url}",
-                    severity_hint= "MEDIUM",
-                    raw_evidence=  line,
-                    source_tool=   self.tool_type.value,
+                result.findings.append(build_finding(
+                    "HTTP_ONLY",
+                    hostname, port=port, protocol="tcp", service="http",
+                    evidence=line, source_tool=self.tool_type.value,
                 ))
 
         if not result.assets:

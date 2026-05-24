@@ -20,6 +20,8 @@ Supported frameworks:
     CIS        — CIS Controls v8
     HIPAA      — Health Insurance Portability and Accountability Act (Security Rule)
     ISO27001   — ISO/IEC 27001:2022
+    NIST       — NIST SP 800-53 Rev. 5 control identifiers
+    SOC2       — SOC 2 Trust Services Criteria (CC series)
 
 Usage:
     from intelligence.compliance import get_compliance_refs
@@ -167,19 +169,27 @@ _COMPLIANCE_MAP: dict[str, dict[str, list[str]]] = {
         # PCI-DSS 4.0 Req 1.3 restricts inbound/outbound traffic.
         # CIS Control 4.4 requires disabling unused ports and services.
         # ISO 27001:2022 A.13.1.1 covers network controls.
+        # NIST SP 800-53: CM-7 (least functionality), SC-7 (boundary protection).
+        # SOC 2 TSC: CC6.6 (boundary protections), CC6.1 (logical access).
         "PCI-DSS":   ["1.3.1", "1.3.2"],
         "CIS":       ["4.4", "12.1"],
         "ISO27001":  ["A.13.1.1", "A.13.1.3"],
+        "NIST":      ["CM-7", "SC-7"],
+        "SOC2":      ["CC6.6", "CC6.1"],
     },
 
     "HTTP_ONLY": {
         # Serving over plain HTTP exposes all traffic to interception.
         # PCI-DSS 4.0 Req 4.2.1 and 6.4.2 require encrypted transmissions.
         # HIPAA 164.312(e)(1) mandates encryption for ePHI in transit.
+        # NIST SP 800-53: SC-8 (transmission confidentiality/integrity).
+        # SOC 2 TSC: CC6.7 (data in transit protection).
         "PCI-DSS":   ["4.2.1", "6.4.2"],
         "HIPAA":     ["164.312(e)(1)"],
         "CIS":       ["9.2"],
         "ISO27001":  ["A.14.1.2"],
+        "NIST":      ["SC-8"],
+        "SOC2":      ["CC6.7"],
     },
 
     "VERSION_DISCLOSURE": {
@@ -190,6 +200,8 @@ _COMPLIANCE_MAP: dict[str, dict[str, list[str]]] = {
         "PCI-DSS":   ["6.3.3"],
         "CIS":       ["2.2"],
         "ISO27001":  ["A.12.6.1"],
+        "NIST":      ["CM-6", "SI-2"],
+        "SOC2":      ["CC7.1"],
     },
 
     "SERVICE_VERSION_DISCLOSURE": {
@@ -197,6 +209,8 @@ _COMPLIANCE_MAP: dict[str, dict[str, list[str]]] = {
         "PCI-DSS":   ["6.3.3"],
         "CIS":       ["2.2"],
         "ISO27001":  ["A.12.6.1"],
+        "NIST":      ["CM-6", "SI-2"],
+        "SOC2":      ["CC7.1"],
     },
 
     "OUTDATED_SERVICE": {
@@ -206,6 +220,99 @@ _COMPLIANCE_MAP: dict[str, dict[str, list[str]]] = {
         "PCI-DSS":   ["6.3.1", "6.3.3"],
         "CIS":       ["2.2", "7.4"],
         "ISO27001":  ["A.12.6.1"],
+        "NIST":      ["SI-2"],
+        "SOC2":      ["CC7.1"],
+    },
+
+    # =========================================================================
+    # Network service exposure findings (Phase A-1 — finding_catalog taxonomy)
+    # =========================================================================
+
+    "HTTPS_MISSING": {
+        # No TLS/HTTPS option at all — all traffic is necessarily cleartext.
+        "PCI-DSS":   ["4.2.1", "6.4.2"],
+        "HIPAA":     ["164.312(e)(1)"],
+        "CIS":       ["3.10", "9.2"],
+        "ISO27001":  ["A.14.1.2", "A.10.1.1"],
+        "NIST":      ["SC-8", "SC-13"],
+        "SOC2":      ["CC6.7"],
+    },
+
+    "TELNET_EXPOSED": {
+        # Telnet transmits credentials/session data in cleartext.
+        # PCI-DSS 4.0 Req 2.2.7 requires strong crypto for non-console admin access.
+        "PCI-DSS":   ["2.2.7", "4.2.1"],
+        "HIPAA":     ["164.312(e)(1)"],
+        "CIS":       ["4.4", "4.6"],
+        "ISO27001":  ["A.13.1.1", "A.9.4.2"],
+        "NIST":      ["AC-17", "SC-8", "CM-7"],
+        "SOC2":      ["CC6.1", "CC6.6"],
+    },
+
+    "FTP_EXPOSED": {
+        # Plain FTP transmits credentials and file contents in cleartext.
+        "PCI-DSS":   ["2.2.7", "4.2.1"],
+        "HIPAA":     ["164.312(e)(1)"],
+        "CIS":       ["4.4", "3.10"],
+        "ISO27001":  ["A.13.1.1", "A.10.1.1"],
+        "NIST":      ["SC-8", "CM-7"],
+        "SOC2":      ["CC6.7", "CC6.6"],
+    },
+
+    "SMBV1_ENABLED": {
+        # SMBv1 is the EternalBlue/WannaCry attack surface; deprecated by vendors.
+        "PCI-DSS":   ["2.2.4", "6.3.3"],
+        "CIS":       ["4.4", "4.8"],
+        "ISO27001":  ["A.12.6.1", "A.13.1.1"],
+        "NIST":      ["CM-7", "SI-2"],
+        "SOC2":      ["CC6.6", "CC7.1"],
+    },
+
+    # =========================================================================
+    # TLS finding aliases (Phase A-1 names used by finding_catalog / parsers).
+    # These mirror the canonical WEAK_TLS_VERSION / *_CERTIFICATE entries above
+    # so that compliance refs resolve regardless of which name a parser emits.
+    # (This also activates the SSLScan parser's existing EXPIRED_CERT /
+    #  SELF_SIGNED_CERT finding types, which previously had no mapping.)
+    # =========================================================================
+
+    "WEAK_TLS": {
+        "PCI-DSS":   ["4.2.1", "4.2.2"],
+        "HIPAA":     ["164.312(e)(1)", "164.312(e)(2)(ii)"],
+        "CIS":       ["3.10"],
+        "ISO27001":  ["A.10.1.1", "A.14.1.3"],
+        "NIST":      ["SC-8", "SC-13"],
+        "SOC2":      ["CC6.7"],
+    },
+
+    "EXPIRED_CERT": {
+        "PCI-DSS":   ["4.2.1"],
+        "HIPAA":     ["164.312(e)(1)"],
+        "CIS":       ["3.10"],
+        "ISO27001":  ["A.10.1.2"],
+        "NIST":      ["SC-12", "SC-17"],
+        "SOC2":      ["CC6.7"],
+    },
+
+    "SELF_SIGNED_CERT": {
+        "PCI-DSS":   ["4.2.1"],
+        "CIS":       ["3.10"],
+        "ISO27001":  ["A.10.1.2"],
+        "NIST":      ["SC-12", "SC-17"],
+        "SOC2":      ["CC6.7"],
+    },
+
+    # =========================================================================
+    # Operating system findings
+    # =========================================================================
+
+    "EOL_OPERATING_SYSTEM": {
+        # Unsupported OS releases never receive security updates.
+        "PCI-DSS":   ["6.3.1", "6.3.3"],
+        "CIS":       ["2.2", "7.4"],
+        "ISO27001":  ["A.12.6.1"],
+        "NIST":      ["SI-2", "CM-6"],
+        "SOC2":      ["CC7.1"],
     },
 }
 

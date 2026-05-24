@@ -238,6 +238,16 @@ def _collect_findings(parsed_data_list: list) -> list[dict]:
                 "severity_hint": getattr(f, "severity_hint", None) or "INFO",
                 "raw_evidence":  getattr(f, "raw_evidence", None) or "",
                 "source_tool":   getattr(f, "source_tool", ""),
+                # ── Phase 1C: preserve deterministic catalog metadata ──────
+                # These are attached by intelligence/finding_catalog.build_finding()
+                # and are AUTHORITATIVE. They must survive the analyzer intact so
+                # the reporter can render real titles, remediation, and compliance
+                # references — with full quality even when Gemini is unavailable.
+                "finding_id":      getattr(f, "finding_id", "") or "",
+                "title":           getattr(f, "title", "") or "",
+                "remediation":     getattr(f, "remediation", "") or "",
+                "compliance_refs": getattr(f, "compliance_refs", None) or {},
+                "confidence":      getattr(f, "confidence", 1.0),
             })
     return findings
 
@@ -369,9 +379,14 @@ def _enrich_finding(
         port               = port,
         analyst_narrative  = parsed.get("analyst_narrative", ""),
         business_impact    = parsed.get("business_impact", ""),
-        severity_label     = parsed.get("severity_label", finding.get("severity_hint", "INFO")),
+        # Phase 1C: severity is deterministic (catalog), NOT AI-supplied.
+        # The catalog severity is authoritative; any model-suggested
+        # severity_label in the response is treated as advisory and ignored
+        # so AI can never silently up/down-grade a deterministic finding.
+        severity_label     = finding.get("severity_hint", "INFO"),
         enriched           = True,
         raw_finding_detail = finding.get("detail", ""),
+        **_deterministic_summary_fields(finding),
     )
 
 
@@ -490,12 +505,33 @@ def _enrich_executive_summary(
 # Fallback constructors — used when Gemini is unavailable
 # ---------------------------------------------------------------------------
 
+def _deterministic_summary_fields(finding: dict) -> dict:
+    """
+    Phase 1C: return the deterministic catalog metadata kwargs that must be
+    copied verbatim onto every AIFindingSummary.
+
+    These come from intelligence/finding_catalog.build_finding() and are
+    AUTHORITATIVE. They are never sourced from, nor overwritten by, AI output —
+    the AI layer only adds analyst_narrative / business_impact. Centralized here
+    so the enriched and fallback constructors can never drift apart.
+    """
+    return {
+        "finding_id":      finding.get("finding_id", "") or "",
+        "title":           finding.get("title", "") or "",
+        "remediation":     finding.get("remediation", "") or "",
+        "compliance_refs": finding.get("compliance_refs", {}) or {},
+        "confidence":      finding.get("confidence", 1.0),
+    }
+
+
 def _make_fallback_summary(finding: dict) -> AIFindingSummary:
     """
     Construct an unenriched AIFindingSummary from raw finding data.
 
-    Used when Gemini is unavailable or a call fails. The reporter uses
-    raw_finding_detail as the fallback text in the DOCX report.
+    Used when Gemini is unavailable or a call fails. Phase 1C: even unenriched,
+    the summary now carries the full deterministic catalog metadata (title,
+    remediation, compliance_refs), so the reporter renders a complete,
+    professional finding offline — no boilerplate reconstruction.
     """
     return AIFindingSummary(
         finding_type       = finding.get("finding_type", "UNKNOWN"),
@@ -506,6 +542,7 @@ def _make_fallback_summary(finding: dict) -> AIFindingSummary:
         severity_label     = finding.get("severity_hint", "INFO"),
         enriched           = False,
         raw_finding_detail = finding.get("detail", ""),
+        **_deterministic_summary_fields(finding),
     )
 
 

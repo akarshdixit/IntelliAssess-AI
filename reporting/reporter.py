@@ -84,6 +84,31 @@ except ImportError:
     def describe_adjustments(_ctx: dict) -> list:        # type: ignore[misc]
         return []
 
+# Phase 1D-A: deterministic finding correlation (presentational grouping only)
+try:
+    from intelligence.finding_groups import group_findings as _group_findings
+except ImportError:
+    # Graceful degradation: render every finding under a single neutral theme
+    # so the report still produces correct output without the grouping module.
+    class _FallbackGroup:                                 # type: ignore[misc]
+        title   = "Security Findings"
+        summary = ""
+
+    def _group_findings(findings):                        # type: ignore[misc]
+        return [(_FallbackGroup(), list(findings))]
+
+# Phase 1D-B: deterministic remediation prioritization engine (offline-first)
+try:
+    from intelligence.remediation_roadmap import build_roadmap as _build_roadmap
+    _ROADMAP_ENGINE_AVAILABLE = True
+except ImportError:
+    # Graceful degradation: without the engine the roadmap section falls back
+    # to a brief pointer to the per-finding guidance (never crashes).
+    _ROADMAP_ENGINE_AVAILABLE = False
+
+    def _build_roadmap(findings, **kwargs):               # type: ignore[misc]
+        return None
+
 log = get_logger(__name__)
 
 # Default output filename placed in the session's reports/ subdirectory.
@@ -570,9 +595,10 @@ class DocxReporter:
         T.add_body_paragraph(
             doc,
             f"This section presents {len(security_findings)} security finding(s) identified "
-            "during the assessment, organised by assessed asset. Each finding includes an "
-            "analyst narrative, business impact statement, compliance references, and "
-            "remediation guidance."
+            "during the assessment. Findings are organised by assessed asset and, within "
+            "each asset, correlated into security themes so that related weaknesses are "
+            "evaluated together. Each finding retains its own evidence, compliance "
+            "references, and remediation guidance."
         )
         T.add_spacer(doc)
 
@@ -605,11 +631,45 @@ class DocxReporter:
             self._render_target_header(target_name, target_findings, ctx)
             T.add_spacer(doc, pt=4)
 
-            # Individual finding blocks under this target
-            for finding in target_findings:
-                self._render_finding_block(global_idx, finding, ctx)
-                T.add_spacer(doc, pt=10)
-                global_idx += 1
+            # Phase 1D-A: correlate this asset's findings into security themes.
+            # Grouping is presentational only — every finding is still rendered
+            # in full (evidence, compliance, remediation) inside its theme.
+            for group_meta, theme_findings in _group_findings(target_findings):
+                self._render_theme_header(group_meta, theme_findings)
+                for finding in theme_findings:
+                    self._render_finding_block(global_idx, finding, ctx)
+                    T.add_spacer(doc, pt=10)
+                    global_idx += 1
+
+    def _render_theme_header(self, group_meta, findings: list) -> None:
+        """
+        Render a security-theme header within an asset (Phase 1D-A).
+
+        Shows a level-3 heading with the theme title, a compact severity tally
+        for the theme, and a one-line analyst framing. Purely presentational —
+        no data is mutated and no finding is merged or hidden.
+        """
+        doc = self.doc
+
+        title   = getattr(group_meta, "title", "Security Findings")
+        summary = getattr(group_meta, "summary", "") or ""
+
+        # Compact severity tally for this theme.
+        sev_counts: dict[str, int] = {}
+        for f in findings:
+            sev = (getattr(f, 'severity_label', 'INFO') or 'INFO').upper()
+            sev_counts[sev] = sev_counts.get(sev, 0) + 1
+        ordered_sevs = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+        tally = ",  ".join(f"{sev_counts[s]} {s}" for s in ordered_sevs if s in sev_counts)
+
+        doc.add_heading(title, level=3)
+        count_label = f"{len(findings)} finding{'s' if len(findings) != 1 else ''}"
+        if tally:
+            count_label += f"  ({tally})"
+        T.add_label_paragraph(doc, count_label)
+        if summary:
+            T.add_body_paragraph(doc, summary)
+        T.add_spacer(doc, pt=4)
 
     def _render_target_header(
         self,
@@ -719,7 +779,10 @@ class DocxReporter:
 
         title_cell = hdr.cell(0, 1)
         T.shade_cell(title_cell, T.COL_NAVY_HEX)
-        title_text = f"Finding {idx}:  {finding_type.replace('_', ' ').title()}"
+        # Phase 1C: use the deterministic catalog title propagated on the
+        # finding; fall back to a prettified finding_type only if absent.
+        det_title  = getattr(finding, 'title', '') or ''
+        title_text = f"Finding {idx}:  {det_title or finding_type.replace('_', ' ').title()}"
         if target:
             title_text += f"  —  {target}"
         if severity_was_raised:
@@ -755,15 +818,34 @@ class DocxReporter:
             T.add_body_paragraph(doc, business_impact)
 
         # ── Remediation guidance ───────────────────────────────────────────
-        remediation = self.enriched.get_remediation(finding_type)
-        if remediation and getattr(remediation, 'enriched', False):
+        # Phase 1C: the deterministic catalog remediation (finding.remediation)
+        # is the AUTHORITATIVE baseline and is always rendered when present, so
+        # offline reports carry real, finding-specific guidance instead of
+        # generic boilerplate. AI remediation, when available, is layered on top
+        # as structured, prioritized actions/commands/references.
+        det_remediation = getattr(finding, 'remediation', '') or ''
+        remediation     = self.enriched.get_remediation(finding_type)
+        ai_enriched     = bool(remediation and getattr(remediation, 'enriched', False))
+
+        T.add_label_paragraph(doc, "Recommendation")
+        if det_remediation:
+            T.add_body_paragraph(doc, det_remediation)
+        elif not ai_enriched:
+            # Only reached when neither deterministic nor AI remediation exists.
+            T.add_body_paragraph(
+                doc,
+                "Consult vendor documentation and relevant security standards to "
+                "address this finding. Prioritize based on the severity rating above."
+            )
+
+        if ai_enriched:
             immediate   = getattr(remediation, 'immediate_actions', []) or []
             short_term  = getattr(remediation, 'short_term_actions', []) or []
             commands    = getattr(remediation, 'commands', []) or []
             references  = getattr(remediation, 'references', []) or []
 
             if immediate or short_term:
-                T.add_label_paragraph(doc, "Recommendation")
+                T.add_label_paragraph(doc, "Prioritized Remediation Actions")
                 for action in immediate:
                     T.add_bullet_paragraph(doc, action)
                 for action in short_term:
@@ -778,20 +860,15 @@ class DocxReporter:
                 T.add_label_paragraph(doc, "References")
                 for ref in references:
                     T.add_bullet_paragraph(doc, ref)
-        else:
-            # Minimal fallback recommendation
-            T.add_label_paragraph(doc, "Recommendation")
-            T.add_body_paragraph(
-                doc,
-                "Consult vendor documentation and relevant security standards to "
-                "address this finding. Prioritize based on the severity rating above."
-            )
 
-        # ── Phase 5-1: Compliance references ──────────────────────────────
-        # Deterministic lookup — no AI, no scoring, no reasoning.
-        # Renders a two-column table: Framework | Control References
+        # ── Phase 5-1 / 1C: Compliance references ─────────────────────────
+        # Deterministic — no AI, no scoring, no reasoning.
+        # Phase 1C: prefer the compliance refs propagated on the finding (attached
+        # by build_finding at construction time); fall back to a fresh catalog
+        # lookup so summaries that predate propagation still render references.
+        # Renders a two-column table: Framework | Control References.
         # Suppressed silently when no mapping exists for this finding type.
-        compliance_refs = get_compliance_refs(finding_type)
+        compliance_refs = getattr(finding, 'compliance_refs', None) or get_compliance_refs(finding_type)
         if compliance_refs:
             T.add_label_paragraph(doc, "Compliance References")
             ref_rows = list(compliance_refs.items())
@@ -938,7 +1015,13 @@ class DocxReporter:
 
         # ── Accepted cipher suites ─────────────────────────────────────────
         # Identify weak ciphers by cross-referencing WEAK_CIPHER findings
-        weak_cipher_names = self._collect_weak_cipher_names(target)
+        # against the canonical inventory names (format-agnostic match).
+        inventory_cipher_names = [
+            c["cipher"] for c in cipher_inventory if c.get("cipher")
+        ]
+        weak_cipher_names = self._collect_weak_cipher_names(
+            target, inventory_cipher_names
+        )
 
         if cipher_inventory:
             strong = [c["cipher"] for c in cipher_inventory if c["cipher"] not in weak_cipher_names]
@@ -1129,124 +1212,133 @@ class DocxReporter:
 
     def _build_remediation_roadmap(self) -> None:
         """
-        Build the Remediation Roadmap section.
+        Build the Remediation Roadmap section (Phase 1D-B).
 
-        Organizes AIRemediation entries across three time horizons:
-          - Immediate  (24-72 hours) — critical risk reduction
-          - Short-term (next sprint/patch cycle) — sustainable improvements
-          - References — standards and documentation relevant to findings
+        DETERMINISTIC-FIRST: a finding-driven prioritization engine
+        (intelligence/remediation_roadmap.py) consolidates findings into
+        de-duplicated remediation objectives and sequences them across three
+        delivery horizons — Immediate (0–7 days), Short-Term Hardening
+        (7–30 days), and Strategic Improvements (30–90 days). Placement uses the
+        same context-adjusted severity as the finding badges, capped by a per-
+        objective effort floor, so quick high-urgency wins surface first while
+        inherently long programmes (OS modernization, governance) stay strategic.
 
-        Format: labeled-group bullet lists with finding-type context tags.
+        This works fully offline. When AI enrichment is available, model-supplied
+        copy-paste commands are appended as a clearly-labelled supplement — the
+        AI never owns the structure, prioritization, or sequencing.
         """
-        doc          = self.doc
-        remediations = getattr(self.enriched, 'remediations', []) or []
+        doc = self.doc
 
         doc.add_heading("Remediation Roadmap", level=1)
         T.add_horizontal_rule(doc)
 
         T.add_body_paragraph(
             doc,
-            "The following remediation roadmap prioritizes identified findings into "
-            "actionable time-bound phases. Immediate actions address the highest-severity "
-            "risks. Short-term actions represent planned improvements for the next "
-            "development or operations cycle."
+            "This roadmap consolidates the assessment's findings into prioritised "
+            "remediation objectives, sequenced by risk and operational effort. It "
+            "answers what should be addressed first, next, and as part of longer-term "
+            "security maturity. A single objective may resolve several related findings."
         )
         T.add_spacer(doc)
 
-        enriched_remediations = [r for r in remediations if getattr(r, 'enriched', False)]
+        # ── Deterministic roadmap (offline-first) ──────────────────────────
+        ctx     = getattr(self.session, 'context', {}) or {}
+        roadmap = _build_roadmap(
+            self.enriched.finding_summaries,
+            context=ctx,
+            severity_adjuster=_adjust_severity,
+        )
 
-        if not enriched_remediations:
+        rendered_any = False
+        if roadmap is not None and not roadmap.is_empty():
+            for horizon, actions in roadmap.horizons:
+                if not actions:
+                    continue
+                rendered_any = True
+                doc.add_heading(f"{horizon.title}  ({horizon.window})", level=2)
+                T.add_body_paragraph(doc, horizon.framing)
+                for action in actions:
+                    self._render_roadmap_action(action)
+                T.add_spacer(doc, pt=6)
+
+        if not rendered_any:
             T.add_body_paragraph(
                 doc,
-                "Detailed AI-generated remediation guidance was not available for this session. "
-                "Refer to the Technical Findings section for finding-specific recommendations, "
-                "and consult relevant security standards (OWASP, CIS Benchmarks, NIST) for "
-                "general remediation guidance."
+                "No remediation objectives were derived for this assessment. Refer to "
+                "the Technical Findings section for any finding-specific guidance."
             )
             return
 
-        # ── Immediate actions (24-72 hours) ───────────────────────────────
-        immediate_items = [
-            (r.finding_type, action)
-            for r in enriched_remediations
-            for action in (getattr(r, 'immediate_actions', []) or [])
-        ]
-
-        if immediate_items:
-            doc.add_heading("Immediate Actions  (24-72 Hours)", level=2)
-            T.add_body_paragraph(
-                doc,
-                "The following actions should be taken immediately to reduce critical exposure:"
-            )
-            for finding_type, action in immediate_items:
-                label = (finding_type or '').replace('_', ' ').title()
-                para  = doc.add_paragraph(style='List Bullet')
-                tag_run   = para.add_run(f"[{label}]  ")
-                tag_run.bold = True
-                tag_run.font.name = "Arial"
-                tag_run.font.size = Pt(10.5)
-                body_run  = para.add_run(action)
-                body_run.font.name = "Arial"
-                body_run.font.size = Pt(10.5)
-                para.paragraph_format.space_after = Pt(3)
-            T.add_spacer(doc)
-
-        # ── Short-term actions ─────────────────────────────────────────────
-        short_term_items = [
-            (r.finding_type, action)
-            for r in enriched_remediations
-            for action in (getattr(r, 'short_term_actions', []) or [])
-        ]
-
-        if short_term_items:
-            doc.add_heading("Short-Term Actions  (Next Sprint / Patch Cycle)", level=2)
-            T.add_body_paragraph(
-                doc,
-                "The following improvements should be planned into the next development "
-                "or operations sprint:"
-            )
-            for finding_type, action in short_term_items:
-                label = (finding_type or '').replace('_', ' ').title()
-                para  = doc.add_paragraph(style='List Bullet')
-                tag_run   = para.add_run(f"[{label}]  ")
-                tag_run.bold = True
-                tag_run.font.name = "Arial"
-                tag_run.font.size = Pt(10.5)
-                body_run  = para.add_run(action)
-                body_run.font.name = "Arial"
-                body_run.font.size = Pt(10.5)
-                para.paragraph_format.space_after = Pt(3)
-            T.add_spacer(doc)
-
-        # ── Technical commands ─────────────────────────────────────────────
+        # ── Optional AI supplement: copy-paste technical commands ──────────
+        # Deterministic logic owns the structure above; AI commands, when
+        # available, are surfaced here as a clearly-labelled supplement only.
+        remediations = getattr(self.enriched, 'remediations', []) or []
         all_commands = [
-            (r.finding_type, cmd)
-            for r in enriched_remediations
+            (getattr(r, 'finding_type', ''), cmd)
+            for r in remediations if getattr(r, 'enriched', False)
             for cmd in (getattr(r, 'commands', []) or [])
         ]
         if all_commands:
-            doc.add_heading("Technical Commands", level=2)
-            T.add_body_paragraph(doc, "Copy-paste configuration commands for identified findings:")
+            doc.add_heading("Supplementary Technical Commands  (AI-Assisted)", level=2)
+            T.add_body_paragraph(
+                doc,
+                "The following copy-paste commands were generated by AI enrichment to "
+                "support the objectives above. Validate against your environment before use."
+            )
             current_type = None
             for finding_type, cmd in all_commands:
                 if finding_type != current_type:
-                    label = (finding_type or '').replace('_', ' ').title()
-                    T.add_label_paragraph(doc, label)
+                    T.add_label_paragraph(doc, (finding_type or '').replace('_', ' ').title())
                     current_type = finding_type
                 T.add_code_paragraph(doc, cmd)
-            T.add_spacer(doc)
 
-        # ── Standards and references ───────────────────────────────────────
-        all_refs = sorted({
-            ref
-            for r in enriched_remediations
-            for ref in (getattr(r, 'references', []) or [])
-        })
-        if all_refs:
-            doc.add_heading("Standards & References", level=2)
-            T.add_body_paragraph(doc, "Relevant security standards referenced in this assessment:")
-            for ref in all_refs:
-                T.add_bullet_paragraph(doc, ref)
+    def _render_roadmap_action(self, action) -> None:
+        """
+        Render one consolidated remediation objective as a titled bullet with a
+        concise rationale and a transparency footer (findings addressed,
+        compliance frameworks relieved). Purely presentational.
+        """
+        doc = self.doc
+
+        # Objective title (bold lead run) then the concise action detail.
+        para = doc.add_paragraph(style='List Bullet')
+        title_run = para.add_run(getattr(action, 'title', '') or '')
+        title_run.bold = True
+        title_run.font.name = "Arial"
+        title_run.font.size = Pt(10.5)
+        detail = getattr(action, 'detail', '') or ''
+        if detail:
+            body_run = para.add_run(f"  —  {detail}")
+            body_run.font.name = "Arial"
+            body_run.font.size = Pt(10.5)
+        para.paragraph_format.space_after = Pt(2)
+
+        # Transparency footer: findings addressed + compliance frameworks.
+        footer_bits = []
+        count = getattr(action, 'finding_count', 0) or 0
+        if count:
+            footer_bits.append(
+                f"Addresses {count} finding{'s' if count != 1 else ''} "
+                f"(max severity {getattr(action, 'worst_severity', 'INFO')})"
+            )
+        frameworks = getattr(action, 'frameworks', []) or []
+        if frameworks:
+            footer_bits.append("Compliance: " + ", ".join(frameworks))
+        if getattr(action, 'governance', False):
+            footer_bits.append("Posture / governance improvement")
+
+        if footer_bits:
+            note = doc.add_paragraph()
+            note.paragraph_format.left_indent = Inches(0.5)
+            note.paragraph_format.space_after = Pt(6)
+            run = note.add_run("   ".join(footer_bits))
+            run.italic = True
+            run.font.name = "Arial"
+            run.font.size = Pt(9)
+            try:
+                run.font.color.rgb = RGBColor.from_string(getattr(T, 'COL_GREY_HEX', '4A4A4A'))
+            except Exception:
+                pass
 
     # =========================================================================
     # Section 8 — Appendix
@@ -1425,27 +1517,27 @@ class DocxReporter:
             T.set_cell_text(sev_table.cell(i, 0), sev,       bold=True, color_hex=fg_hex)
             T.set_cell_text(sev_table.cell(i, 1), str(count))
 
-    def _collect_weak_cipher_names(self, target: str) -> set[str]:
+    def _collect_weak_cipher_names(self, target: str, inventory_cipher_names) -> set[str]:
         """
         Return a set of weak cipher suite names for a given target.
 
-        Cross-references WEAK_CIPHER findings from finding_summaries.
+        Cross-references WEAK_CIPHER findings from finding_summaries against the
+        actual cipher inventory names. Findings are now produced by the
+        centralized finding catalog, whose detail wording is rich prose rather
+        than the legacy "Weak cipher accepted: NAME" shape, so matching is done
+        by the format-agnostic module-level helper ``_match_weak_ciphers`` (the
+        previous ':'-split heuristic would silently mis-classify every cipher
+        as strong against the new detail text).
+
         Used by _render_ssl_block to annotate the cipher inventory display.
         """
-        weak_ciphers: set[str] = set()
-        for f in self.enriched.finding_summaries:
-            if (
-                getattr(f, 'finding_type', '') == 'WEAK_CIPHER'
-                and getattr(f, 'target', '') == target
-            ):
-                detail = getattr(f, 'raw_finding_detail', '') or ''
-                # raw_finding_detail format: "Weak cipher accepted: CIPHER_NAME"
-                # Extract the cipher name from the detail string
-                if ':' in detail:
-                    candidate = detail.split(':', 1)[-1].strip()
-                    if candidate:
-                        weak_ciphers.add(candidate)
-        return weak_ciphers
+        details = [
+            getattr(f, 'raw_finding_detail', '') or ''
+            for f in self.enriched.finding_summaries
+            if getattr(f, 'finding_type', '') == 'WEAK_CIPHER'
+            and getattr(f, 'target', '') == target
+        ]
+        return _match_weak_ciphers(details, inventory_cipher_names)
 
 
 # ---------------------------------------------------------------------------
@@ -1467,6 +1559,40 @@ def _format_date(iso_str: str) -> str:
     except (ValueError, AttributeError):
         # Return the raw string if it's not parseable — better than losing it
         return iso_str[:19].replace("T", " ") if len(iso_str) >= 19 else iso_str
+
+
+def _match_weak_ciphers(details, inventory_cipher_names) -> set[str]:
+    """
+    Return the subset of ``inventory_cipher_names`` that are flagged weak.
+
+    A cipher inventory name is considered weak when its exact canonical name
+    appears as a substring in any of the supplied WEAK_CIPHER finding ``details``
+    strings. This is intentionally format-agnostic: it does NOT assume any
+    particular detail layout (e.g. the legacy "Weak cipher accepted: NAME"
+    shape). The cross-reference therefore survives changes to the catalog's
+    finding-detail wording, which is what made the previous ':'-split approach
+    fragile after findings were routed through the centralized catalog.
+
+    Pure function — no I/O, no instance state — so it can be unit-tested in
+    isolation from the (heavyweight) reporter rendering pipeline.
+
+    Args:
+        details: iterable of finding-detail strings from WEAK_CIPHER findings
+                 for a single target.
+        inventory_cipher_names: iterable of canonical cipher suite names taken
+                 from the SSL cipher inventory.
+
+    Returns:
+        Set of inventory cipher names that were referenced as weak.
+    """
+    detail_blob = "\n".join(d for d in details if d)
+    if not detail_blob:
+        return set()
+    matched: set[str] = set()
+    for name in inventory_cipher_names:
+        if name and name in detail_blob:
+            matched.add(name)
+    return matched
 
 
 def _ctx_value(ctx: dict, key: str) -> str:

@@ -1,43 +1,41 @@
 """
 intelligence/parsers/nmap_parser.py
 =====================================
-Nmap scan output parser for IntelliAssess AI — Phase 3-2.
+Nmap scan output parser for IntelliAssess AI.
 
 Responsibility: parse Nmap scan output (TEXT / XML / GREPABLE) into structured
-ParsedScanData. Deterministic extraction only — no AI, no CVE lookup, no
-severity engine, no compliance logic.
+ParsedScanData, and generate deterministic security findings from the extracted
+infrastructure data via the centralized finding catalog.
+
+Extraction (unchanged): hosts, ports, services, versions, OS inference, rDNS.
+Finding generation (Phase A-1): delegated to intelligence/finding_catalog.py so
+that every finding shares the platform-wide standardized schema (finding_id,
+title, severity, evidence, technical description, remediation, compliance refs,
+confidence). This parser no longer hand-rolls finding objects or invents
+finding_type strings — it observes evidence and asks the catalog to build the
+finding. That keeps a future migration to intelligence/findings_engine.py
+mechanical.
 
 Supported subtypes:
   TEXT     (-oN) — PRIMARY. Full parsing: hosts, ports, services,
-                   versions, OS inference, lightweight findings.
+                   versions, OS inference, findings.
   XML      (-oX) — LIGHTWEIGHT. Regex-based host/port/service extraction.
   GREPABLE (-oG) — LIGHTWEIGHT. Host:/Ports: line extraction.
 
-Finding types generated (deterministic, port-number driven):
-  OPEN_FTP_PORT     — port 21 open
-  OPEN_TELNET_PORT  — port 23 open
-  OPEN_SSH_PORT     — port 22 open
-  OPEN_SMTP_PORT    — port 25 open
-  OPEN_SMB_PORT     — port 445 open
-  OPEN_RDP_PORT     — port 3389 open
-  OPEN_VNC_PORT     — port 5900 open
-  HIGH_RISK_PORT    — suspicious/unusual port open
-  UNKNOWN_SERVICE   — open port with unrecognized service on non-standard port
+Finding types generated (deterministic, catalog-driven):
+  OPEN_PORT                  — every open port (attack-surface inventory, INFO)
+  SERVICE_VERSION_DISCLOSURE — open service leaks a product/version banner
+  OUTDATED_SERVICE           — banner matches a known-outdated version pattern
+  HTTP_ONLY                  — cleartext HTTP exposed (TLS also present on host)
+  HTTPS_MISSING              — HTTP exposed with no TLS service on the host
+  TELNET_EXPOSED             — port 23 open
+  FTP_EXPOSED                — port 21 open
+  SMBV1_ENABLED              — port 445 open with explicit SMBv1 banner indicators
+  EOL_OPERATING_SYSTEM       — OS fingerprint matches an end-of-life pattern
 
-Intentionally NOT in this phase:
-  - CVE correlation         (Phase 4 — cve_enricher.py)
-  - Severity adjustment     (Phase 4 — context_risk_engine.py)
-  - AI-generated narrative  (Phase 4 — analyzer.py + LLMClient)
-  - Compliance mapping      (Phase 5 — compliance_engine.py)
-
-Integration:
-  - Registered at module load via register() from parsers/registry.py
-  - Imported in intelligence/parsers/__init__.py (triggers registration)
-  - Called from core/ingest.py via parse_file() after extract_targets()
-
-Phase 3-3 note:
-  HttpxParser is next. HTTP/HTTPS/SSL ports are intentionally skipped by
-  this parser — HttpxParser owns all web-layer findings.
+Intentionally NOT here:
+  - CVE correlation, severity contextualization (risk_adjustment.py at report time),
+    AI narrative, deep TLS/header analysis (SSLScan / Httpx parsers own those).
 """
 
 from __future__ import annotations
@@ -47,6 +45,11 @@ from pathlib import Path
 from typing import Optional
 
 from intelligence.file_classifier import NmapSubtype, ToolType
+from intelligence.finding_catalog import (
+    build_finding,
+    is_eol_os,
+    is_outdated_service,
+)
 from parsers.base import BaseParser, ParsedScanData
 from parsers.models import ParsedAsset, ParsedFinding, ParsedService
 from parsers.registry import register
@@ -56,82 +59,59 @@ log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Port-based finding classification tables
+# Port / service classification tables (drive catalog-based finding selection)
 # ---------------------------------------------------------------------------
 
-# Ports with a specific finding type and severity hint.
-# (finding_type, severity_hint)
-_CLASSIFIED_PORTS: dict[int, tuple[str, str]] = {
-    21:   ("OPEN_FTP_PORT",    "HIGH"),
-    22:   ("OPEN_SSH_PORT",    "MEDIUM"),
-    23:   ("OPEN_TELNET_PORT", "HIGH"),
-    25:   ("OPEN_SMTP_PORT",   "MEDIUM"),
-    110:  ("OPEN_POP3_PORT",   "MEDIUM"),
-    143:  ("OPEN_IMAP_PORT",   "MEDIUM"),
-    445:  ("OPEN_SMB_PORT",    "HIGH"),
-    3389: ("OPEN_RDP_PORT",    "HIGH"),
-    5900: ("OPEN_VNC_PORT",    "HIGH"),
+# Ports that map directly to a specific cleartext/legacy-protocol finding type.
+_PORT_FINDING_TYPE: dict[int, str] = {
+    21:  "FTP_EXPOSED",
+    23:  "TELNET_EXPOSED",
 }
 
-# Unusual / suspicious ports — generate HIGH_RISK_PORT finding.
-_HIGH_RISK_PORTS: frozenset[int] = frozenset([
-    31337, 1337, 4444, 5555, 6666, 7777,
-    6667, 6668, 6669,   # IRC
-    1080,               # SOCKS proxy
-    3128,               # Squid proxy
-    9001, 9030,         # Tor
-])
+# Service labels (and ports) considered HTTP (cleartext web).
+_HTTP_SERVICES: frozenset[str] = frozenset(["http", "http-alt", "http-proxy"])
+_HTTP_PORTS:    frozenset[int] = frozenset([80, 8080, 8000, 8888])
 
-# Service names that belong to the HTTP/SSL layer — skip here, let
-# HttpxParser (Phase 3-3) own all web findings.
-_WEB_SERVICES: frozenset[str] = frozenset([
-    "http", "https", "ssl", "ssl/http", "http-alt",
-    "https-alt", "http-proxy",
+# Service labels (and ports) considered TLS-wrapped web / TLS present.
+_TLS_HINT_SERVICES: frozenset[str] = frozenset([
+    "https", "ssl/http", "ssl", "https-alt", "ssl/https",
 ])
+_TLS_PORTS: frozenset[int] = frozenset([443, 8443])
 
-# Service names that produce no finding (informational only).
-_INFO_ONLY_SERVICES: frozenset[str] = frozenset([
-    "tcpwrapped",   # port wrapped — no clean banner
-    "unknown",
-])
+# Services that carry no useful banner — skip version-disclosure findings.
+_INFO_ONLY_SERVICES: frozenset[str] = frozenset(["tcpwrapped", "unknown", ""])
+
+# SMB ports — only flag SMBv1 when the banner explicitly indicates v1.
+# "cifs" is intentionally NOT a hint: CIFS is a loose dialect label that does
+# not reliably imply SMBv1, and a false SMBv1 claim erodes report trust.
+_SMB_PORTS: frozenset[int] = frozenset([445, 139])
+_SMBV1_HINTS: tuple[str, ...] = ("smbv1", "smb 1", "smb1", "smb v1", "smb1_enabled")
 
 
 # ---------------------------------------------------------------------------
 # Compiled regexes — TEXT format
 # ---------------------------------------------------------------------------
 
-# "# Nmap 7.80 scan initiated ..."
 _T_HEADER_RE = re.compile(
     r"#\s*Nmap\s+(\S+)\s+scan\s+initiated",
     re.IGNORECASE,
 )
-
-# "Nmap scan report for hostname (IP)" or "for IP"
 _T_REPORT_RE = re.compile(
     r"^Nmap scan report for\s+(\S+?)(?:\s+\(([^)]+)\))?$",
     re.MULTILINE | re.IGNORECASE,
 )
-
-# Port table row: "80/tcp   open   http   nginx 1.24.0 (Ubuntu)"
-# Groups: port, proto, state, service, version(optional)
 _T_PORT_RE = re.compile(
     r"^(\d+)/(tcp|udp)\s+(open(?:\|filtered)?|closed|filtered)\s+(\S+)(?:\s+(.+))?$",
     re.MULTILINE | re.IGNORECASE,
 )
-
-# "Host is up (0.006s latency)." or "Host is down."
 _T_HOST_STATE_RE = re.compile(
     r"Host is (up|down)",
     re.IGNORECASE,
 )
-
-# rDNS record: "rDNS record for 3.108.93.130: ec2-3-108-..."
 _T_RDNS_RE = re.compile(
     r"rDNS record for\s+[\d\.]+:\s+(\S+)",
     re.IGNORECASE,
 )
-
-# OS inference lines — priority order handled in _extract_os_text()
 _T_OS_DETAILS_RE = re.compile(
     r"^OS details:\s+(.+)$",
     re.MULTILINE | re.IGNORECASE,
@@ -144,8 +124,6 @@ _T_AGGRESSIVE_OS_RE = re.compile(
     r"Aggressive OS guesses:\s+([^\n]+)",
     re.IGNORECASE,
 )
-
-# "Service Info: OS: Linux; CPE: ..."
 _T_SERVICE_INFO_RE = re.compile(
     r"^Service Info:\s+(.+)$",
     re.MULTILINE | re.IGNORECASE,
@@ -154,8 +132,6 @@ _T_SI_OS_RE = re.compile(
     r"OS:\s*([^;,\n]+)",
     re.IGNORECASE,
 )
-
-# "Not shown: 8318 filtered ports"
 _T_NOT_SHOWN_RE = re.compile(
     r"Not shown:\s+(\d+)\s+(filtered|closed)",
     re.IGNORECASE,
@@ -191,7 +167,6 @@ _X_OSCLASS_RE    = re.compile(r'<osclass\b[^>]*\bosfamily="([^"]*)"', re.IGNOREC
 _G_VERSION_RE   = re.compile(r'^#\s*Nmap\s+(\S+)\s+scan', re.MULTILINE | re.IGNORECASE)
 _G_HOST_RE      = re.compile(r'^Host:\s+(\S+)\s+\(([^)]*)\)', re.MULTILINE | re.IGNORECASE)
 _G_PORTS_RE     = re.compile(r'\bPorts:\s+([^\t\n]+)', re.IGNORECASE)
-# Each port entry in grepable: "80/open/tcp//http//nginx 1.24.0/"
 _G_PORT_ENTRY_RE = re.compile(
     r'(\d+)/(open|closed|filtered)/(tcp|udp)//([^/]*)//([^/,]*)',
     re.IGNORECASE,
@@ -206,12 +181,9 @@ class NmapParser(BaseParser):
     """
     Parser for Nmap scan output in TEXT, XML, and GREPABLE formats.
 
-    TEXT (-oN) is the primary and highest-quality parsing path.
-    XML  (-oX) and GREPABLE (-oG) are lightweight secondary paths.
-
-    All three paths produce ParsedScanData with the same field contract.
-    TEXT produces the richest output: version strings, OS inference,
-    rDNS aliases, and port-based lightweight findings.
+    Extraction populates ParsedAsset/ParsedService objects. Finding generation
+    is centralized in _generate_findings_for_asset(), shared by all three
+    format paths, and built entirely through the finding catalog.
     """
 
     tool_type = ToolType.NMAP
@@ -226,12 +198,7 @@ class NmapParser(BaseParser):
         file_path: Path,
         nmap_subtype: Optional[NmapSubtype] = None,
     ) -> ParsedScanData:
-        """
-        Dispatch to format-specific parser based on nmap_subtype.
-
-        Falls back to TEXT parser when subtype is UNKNOWN — TEXT has the
-        broadest regex coverage and handles most real-world scan outputs.
-        """
+        """Dispatch to the format-specific parser; TEXT handles TEXT/UNKNOWN."""
         result = self._empty_result(nmap_subtype=nmap_subtype)
 
         try:
@@ -240,7 +207,6 @@ class NmapParser(BaseParser):
             elif nmap_subtype is NmapSubtype.GREPABLE:
                 self._parse_grepable(content, file_path, result)
             else:
-                # TEXT or UNKNOWN — TEXT parser handles both
                 self._parse_text(content, file_path, result)
         except Exception as exc:
             self._add_error(result, f"unexpected exception during parse: {exc!r}")
@@ -263,37 +229,19 @@ class NmapParser(BaseParser):
         file_path: Path,
         result: ParsedScanData,
     ) -> None:
-        """
-        Parse Nmap plain-text (-oN) output.
-
-        Strategy:
-          1. Extract tool version from header comment.
-          2. Find all "Nmap scan report for" lines — each marks a host block.
-          3. Slice the content into per-host blocks between consecutive report lines.
-          4. Parse each host block: report line → hostname/IP, port table,
-             OS detection, Service Info, rDNS.
-          5. Set primary_target from the first host's report line.
-          6. Append ParsedAsset and ParsedFindings to result for each host.
-        """
-        # ── Tool version ──────────────────────────────────────────────────
+        """Parse Nmap plain-text (-oN) output."""
         vm = _T_HEADER_RE.search(content)
         if vm:
             result.tool_version = f"Nmap {vm.group(1)}"
             result.scan_metadata["nmap_version"] = vm.group(1)
 
-        # ── Locate all report lines ───────────────────────────────────────
         report_matches = list(_T_REPORT_RE.finditer(content))
-
         if not report_matches:
             self._add_error(result, "no 'Nmap scan report for' lines found in TEXT output")
             return
 
-        # ── Set primary_target from first host ────────────────────────────
-        first = report_matches[0]
-        # Prefer hostname over bare IP as the primary target label
-        result.primary_target = first.group(1)
+        result.primary_target = report_matches[0].group(1)
 
-        # ── Build per-host block slices ───────────────────────────────────
         for i, m in enumerate(report_matches):
             start = m.start()
             end   = report_matches[i + 1].start() if i + 1 < len(report_matches) else len(content)
@@ -301,6 +249,7 @@ class NmapParser(BaseParser):
 
             asset = self._parse_text_host_block(m, block, result)
             if asset is not None:
+                self._generate_findings_for_asset(asset, result)
                 result.assets.append(asset)
 
         result.scan_metadata["total_hosts"] = len(result.assets)
@@ -311,50 +260,34 @@ class NmapParser(BaseParser):
         block: str,
         result: ParsedScanData,
     ) -> Optional[ParsedAsset]:
-        """
-        Parse a single host block from TEXT output.
+        """Parse a single host block from TEXT output into a ParsedAsset."""
+        token_a = report_m.group(1)
+        token_b = report_m.group(2)
 
-        A block runs from one "Nmap scan report for" line to the next (or EOF).
-        Extracts: hostname/IP identity, open ports + services, OS, rDNS aliases.
-
-        Returns ParsedAsset or None if the block cannot be resolved to any target.
-        """
-        token_a = report_m.group(1)   # hostname or bare IP
-        token_b = report_m.group(2)   # IP in parentheses (may be None)
-
-        # Determine which token is the hostname and which is the IP
         if token_b:
-            # "report for hostname (IP)"
             hostname   = token_a
             ip_address = token_b
         else:
-            # "report for IP" — no hostname resolution recorded
             hostname   = ""
             ip_address = token_a
 
-        # Primary asset identifier: prefer hostname for readability
         asset_value = hostname if hostname else ip_address
         asset_type  = "hostname" if hostname else "ipv4"
 
-        asset = ParsedAsset(
-            value=      asset_value,
-            asset_type= asset_type,
-        )
+        asset = ParsedAsset(value=asset_value, asset_type=asset_type)
 
-        # Populate IP / hostname lists (exclude primary value from duplicates)
         if ip_address and ip_address != asset_value:
             asset.ip_addresses = [ip_address]
         if hostname and hostname != asset_value:
             asset.hostnames = [hostname]
 
-        # ── rDNS alias ────────────────────────────────────────────────────
         rdns_m = _T_RDNS_RE.search(block)
         if rdns_m:
             alias = rdns_m.group(1).strip().rstrip(".")
             if alias and alias not in asset.hostnames and alias != asset_value:
                 asset.hostnames.append(alias)
 
-        # ── Port table ────────────────────────────────────────────────────
+        # ── Port table (extraction only — no finding emission here) ─────────
         for pm in _T_PORT_RE.finditer(block):
             port_num  = int(pm.group(1))
             protocol  = pm.group(2).lower()
@@ -363,37 +296,21 @@ class NmapParser(BaseParser):
             ver_raw   = pm.group(5)
             version   = ver_raw.strip() if ver_raw else None
 
-            svc = ParsedService(
+            asset.services.append(ParsedService(
                 port=         port_num,
                 protocol=     protocol,
                 state=        state,
                 service_name= svc_name,
                 version=      version,
-                extra_info=   pm.group(0).strip(),   # raw port line as evidence
-            )
-            asset.services.append(svc)
+                extra_info=   pm.group(0).strip(),
+            ))
 
-            # Generate finding for open ports only
-            if "open" in state:
-                finding = self._make_port_finding(
-                    port=         port_num,
-                    protocol=     protocol,
-                    service_name= svc_name,
-                    version=      version,
-                    target=       asset_value,
-                    raw_evidence= pm.group(0).strip(),
-                )
-                if finding is not None:
-                    result.findings.append(finding)
-
-        # ── OS detection ──────────────────────────────────────────────────
+        # ── OS detection ────────────────────────────────────────────────────
         os_name, os_conf = self._extract_os_text(block)
         if os_name:
             asset.os_name       = os_name
             asset.os_confidence = os_conf
 
-        # ── Service Info OS fallback ──────────────────────────────────────
-        # "Service Info: OS: Linux; CPE: ..."
         if not asset.os_name:
             si_m = _T_SERVICE_INFO_RE.search(block)
             if si_m:
@@ -402,13 +319,11 @@ class NmapParser(BaseParser):
                     asset.os_name       = os_m2.group(1).strip()
                     asset.os_confidence = "medium"
 
-        # ── Hosting hint — first version string from an open service ─────
         for svc in asset.services:
             if svc.version and "open" in svc.state:
                 asset.hosting_hint = svc.version
                 break
 
-        # ── Not-shown metadata ────────────────────────────────────────────
         ns_m = _T_NOT_SHOWN_RE.search(block)
         if ns_m:
             asset.scan_metadata["not_shown_count"] = int(ns_m.group(1))
@@ -417,30 +332,17 @@ class NmapParser(BaseParser):
         return asset
 
     def _extract_os_text(self, block: str) -> tuple[Optional[str], str]:
-        """
-        Extract OS name and confidence from a TEXT host block.
-
-        Priority (highest to lowest):
-          1. "OS details: ..." — most specific, Nmap confirmed exact match
-          2. "Running: ..."    — good signal, may be a guess
-          3. "Aggressive OS guesses: ..." — first guess, lowest confidence
-
-        Returns (os_name, confidence_label).
-        """
-        # 1. "OS details: Microsoft Windows 10"
+        """Extract OS name and confidence from a TEXT host block."""
         od_m = _T_OS_DETAILS_RE.search(block)
         if od_m:
             return od_m.group(1).strip(), "high"
 
-        # 2. "Running (JUST GUESSING): Linux 2.6.X|3.X|4.X (92%)"
         run_m = _T_RUNNING_RE.search(block)
         if run_m:
-            # Take up to the first comma, strip trailing percentage
             raw = run_m.group(1).split(",")[0].strip()
             raw = re.sub(r"\s*\(\d+%\)\s*$", "", raw).strip()
             return raw, "medium"
 
-        # 3. "Aggressive OS guesses: Linux 2.6.32 (92%), ..."
         agg_m = _T_AGGRESSIVE_OS_RE.search(block)
         if agg_m:
             first_guess = agg_m.group(1).split(",")[0].strip()
@@ -460,23 +362,12 @@ class NmapParser(BaseParser):
         file_path: Path,
         result: ParsedScanData,
     ) -> None:
-        """
-        Parse Nmap XML (-oX) output using regex.
-
-        regex-based (not xml.etree.ElementTree) intentionally: large or
-        truncated XML files from long scans are common. ElementTree raises
-        on any parse error; regex tolerates partial content gracefully.
-
-        Extracts per <host> block: IPs, hostnames, open ports, services,
-        OS match. Generates port-based findings matching TEXT parser output.
-        """
-        # Tool version from <nmaprun version="...">
+        """Parse Nmap XML (-oX) output using regex (tolerates truncation)."""
         vx_m = _X_VERSION_RE.search(content)
         if vx_m:
             result.tool_version = f"Nmap {vx_m.group(1)}"
 
         host_blocks = _X_HOST_BLOCK_RE.findall(content)
-
         if not host_blocks:
             self._add_error(result, "no <host> blocks found in XML output")
             return
@@ -489,6 +380,7 @@ class NmapParser(BaseParser):
             if first:
                 result.primary_target = asset.value
                 first = False
+            self._generate_findings_for_asset(asset, result)
             result.assets.append(asset)
 
     def _parse_xml_host_block(
@@ -497,8 +389,8 @@ class NmapParser(BaseParser):
         result: ParsedScanData,
     ) -> Optional[ParsedAsset]:
         """Parse one <host>...</host> XML block into a ParsedAsset."""
-        ip_matches  = _X_ADDR_RE.findall(block)    # [(addr, addrtype), ...]
-        host_names  = _X_HOSTNAME_RE.findall(block) # [name, ...]
+        ip_matches  = _X_ADDR_RE.findall(block)
+        host_names  = _X_HOSTNAME_RE.findall(block)
 
         ips       = [m[0] for m in ip_matches]
         hostnames = list(host_names)
@@ -508,13 +400,12 @@ class NmapParser(BaseParser):
             return None
 
         asset = ParsedAsset(
-            value=       asset_value,
-            asset_type=  "hostname" if hostnames else "ipv4",
+            value=        asset_value,
+            asset_type=   "hostname" if hostnames else "ipv4",
             ip_addresses= ips,
             hostnames=    hostnames,
         )
 
-        # ── Ports ─────────────────────────────────────────────────────────
         for pm in _X_PORT_RE.finditer(block):
             protocol  = pm.group(1).lower()
             port_num  = int(pm.group(2))
@@ -524,32 +415,18 @@ class NmapParser(BaseParser):
             version   = (pm.group(6) or "").strip()
             extrainfo = (pm.group(7) or "").strip()
 
-            # Build a readable version string from available fields
             ver_parts = [p for p in (product, version, extrainfo) if p]
             ver_str   = " ".join(ver_parts) or None
 
-            svc = ParsedService(
+            asset.services.append(ParsedService(
                 port=         port_num,
                 protocol=     protocol,
                 state=        state,
                 service_name= svc_name,
                 version=      ver_str,
-            )
-            asset.services.append(svc)
+            ))
 
-            if "open" in state:
-                finding = self._make_port_finding(
-                    port=         port_num,
-                    protocol=     protocol,
-                    service_name= svc_name,
-                    version=      ver_str,
-                    target=       asset_value,
-                    raw_evidence= f"port {port_num}/{protocol} {state} {svc_name}",
-                )
-                if finding:
-                    result.findings.append(finding)
-
-        # ── OS — prefer highest-accuracy osmatch, fall back to osclass ────
+        # ── OS — prefer highest-accuracy osmatch, fall back to osclass ───────
         best_os, best_acc = None, -1
         for om in _X_OSMATCH_RE.finditer(block):
             acc = int(om.group(2))
@@ -566,7 +443,6 @@ class NmapParser(BaseParser):
                 asset.os_name       = osc_m.group(1).strip()
                 asset.os_confidence = "low"
 
-        # ── Hosting hint from first open service version ──────────────────
         for svc in asset.services:
             if svc.version and "open" in svc.state:
                 asset.hosting_hint = svc.version
@@ -584,13 +460,7 @@ class NmapParser(BaseParser):
         file_path: Path,
         result: ParsedScanData,
     ) -> None:
-        """
-        Parse Nmap grepable (-oG) output.
-
-        Each host appears on a "Host: IP (hostname)" line.
-        The "Ports:" field on the same line lists port entries in the format:
-          80/open/tcp//http//nginx 1.24.0/
-        """
+        """Parse Nmap grepable (-oG) output."""
         vg_m = _G_VERSION_RE.search(content)
         if vg_m:
             result.tool_version = f"Nmap {vg_m.group(1)}"
@@ -611,8 +481,8 @@ class NmapParser(BaseParser):
                 continue
 
             asset = ParsedAsset(
-                value=       asset_value,
-                asset_type=  "hostname" if hostname_raw else "ipv4",
+                value=        asset_value,
+                asset_type=   "hostname" if hostname_raw else "ipv4",
                 ip_addresses= [ip_raw] if ip_raw else [],
                 hostnames=    [hostname_raw] if hostname_raw else [],
             )
@@ -621,7 +491,6 @@ class NmapParser(BaseParser):
                 result.primary_target = asset_value
                 first = False
 
-            # Extract port entries from "Ports:" field on same line
             ports_m = _G_PORTS_RE.search(line)
             if ports_m:
                 for pe_m in _G_PORT_ENTRY_RE.finditer(ports_m.group(1)):
@@ -631,124 +500,164 @@ class NmapParser(BaseParser):
                     svc_name  = pe_m.group(4).strip()
                     version   = pe_m.group(5).strip() or None
 
-                    svc = ParsedService(
+                    asset.services.append(ParsedService(
                         port=         port_num,
                         protocol=     protocol,
                         state=        state,
                         service_name= svc_name,
                         version=      version,
-                    )
-                    asset.services.append(svc)
+                        extra_info=   pe_m.group(0),
+                    ))
 
-                    if "open" in state:
-                        finding = self._make_port_finding(
-                            port=         port_num,
-                            protocol=     protocol,
-                            service_name= svc_name,
-                            version=      version,
-                            target=       asset_value,
-                            raw_evidence= pe_m.group(0),
-                        )
-                        if finding:
-                            result.findings.append(finding)
-
+            self._generate_findings_for_asset(asset, result)
             result.assets.append(asset)
 
         if not result.assets:
             self._add_error(result, "no 'Host:' lines found in GREPABLE output")
 
     # =========================================================================
-    # Finding generation — deterministic, port-number driven
+    # Finding generation — centralized, catalog-driven, shared by all formats
     # =========================================================================
 
-    def _make_port_finding(
+    def _generate_findings_for_asset(
         self,
-        port: int,
-        protocol: str,
-        service_name: str,
-        version: Optional[str],
-        target: str,
-        raw_evidence: str,
-    ) -> Optional[ParsedFinding]:
+        asset: ParsedAsset,
+        result: ParsedScanData,
+    ) -> None:
         """
-        Generate a ParsedFinding for a single open port.
+        Generate deterministic findings for one fully-parsed asset.
 
-        Decision tree (evaluated in order, first match wins):
-          1. Port in _CLASSIFIED_PORTS → named finding type + assigned severity
-          2. Port in _HIGH_RISK_PORTS  → HIGH_RISK_PORT / LOW
-          3. Service is web (http/https/ssl) → None (HttpxParser owns these)
-          4. Service is info-only (tcpwrapped) → None
-          5. Unrecognized service on unusual port → UNKNOWN_SERVICE / INFO
-          6. Otherwise (standard service, not classified) → None
-
-        Returns ParsedFinding or None if no finding is warranted for this port.
+        Runs after all services and OS data are populated, so host-level logic
+        (e.g. "is any TLS service present?") can see the complete picture. All
+        findings are built through the catalog; this method only decides WHICH
+        finding types apply and supplies the observed evidence.
         """
-        svc_lower = service_name.lower().strip()
+        src = self.tool_type.value
 
-        # 1. Explicitly classified ports (FTP, SSH, Telnet, SMB, etc.)
-        if port in _CLASSIFIED_PORTS:
-            finding_type, severity = _CLASSIFIED_PORTS[port]
-            detail = f"Port {port}/{protocol} open — service: {service_name}"
-            if version:
-                detail += f" ({version})"
-            return ParsedFinding(
-                finding_type=  finding_type,
-                target=        target,
-                port=          port,
-                protocol=      protocol,
-                service=       service_name,
-                detail=        detail,
-                severity_hint= severity,
-                raw_evidence=  raw_evidence,
-                source_tool=   self.tool_type.value,
-            )
+        open_services = [s for s in asset.services if "open" in (s.state or "").lower()]
+        host_has_tls  = any(self._is_tls_service(s) for s in open_services)
 
-        # 2. High-risk / suspicious ports
-        if port in _HIGH_RISK_PORTS:
-            return ParsedFinding(
-                finding_type=  "HIGH_RISK_PORT",
-                target=        target,
-                port=          port,
-                protocol=      protocol,
-                service=       service_name or "unknown",
-                detail=        (
-                    f"Unusual high-risk port {port}/{protocol} open — "
-                    f"service: {service_name or 'unknown'}"
-                ),
-                severity_hint= "LOW",
-                raw_evidence=  raw_evidence,
-                source_tool=   self.tool_type.value,
-            )
+        # Dedup version-disclosure per (product/version) so identical banners on
+        # multiple ports of the same host produce a single finding.
+        seen_versions: set[str] = set()
 
-        # 3. Web services — HttpxParser owns these findings
-        if svc_lower in _WEB_SERVICES:
-            return None
+        for svc in open_services:
+            port      = svc.port
+            svc_lower = (svc.service_name or "").lower().strip()
+            evidence  = svc.extra_info or f"{port}/{svc.protocol} {svc.state} {svc.service_name}".strip()
 
-        # 4. Info-only services — no finding value
-        if svc_lower in _INFO_ONLY_SERVICES:
-            return None
+            specific_emitted = False
 
-        # 5. Unrecognized service on a non-standard high port
-        if (not svc_lower or svc_lower == "unknown") and port > 1024:
-            return ParsedFinding(
-                finding_type=  "UNKNOWN_SERVICE",
-                target=        target,
-                port=          port,
-                protocol=      protocol,
-                service=       service_name or "unknown",
-                detail=        f"Unrecognized service on port {port}/{protocol}",
-                severity_hint= "INFO",
-                raw_evidence=  raw_evidence,
-                source_tool=   self.tool_type.value,
-            )
+            # ── 1. Legacy/cleartext protocol exposures (port-driven) ─────────
+            if port in _PORT_FINDING_TYPE:
+                result.findings.append(build_finding(
+                    _PORT_FINDING_TYPE[port],
+                    asset.value, port=port, protocol=svc.protocol,
+                    service=svc.service_name, version=svc.version,
+                    evidence=evidence, source_tool=src,
+                ))
+                specific_emitted = True
 
-        # 6. Known but unremarkable service — informational only
-        return None
+            # ── 2. SMBv1 — only when the banner explicitly indicates it ──────
+            elif port in _SMB_PORTS:
+                banner = f"{svc_lower} {(svc.version or '').lower()}"
+                if any(h in banner for h in _SMBV1_HINTS):
+                    result.findings.append(build_finding(
+                        "SMBV1_ENABLED",
+                        asset.value, port=port, protocol=svc.protocol,
+                        service=svc.service_name, version=svc.version,
+                        evidence=evidence, source_tool=src,
+                    ))
+                    specific_emitted = True
+
+            # ── 3. Cleartext HTTP (host-aware: HTTP_ONLY vs HTTPS_MISSING) ──
+            elif self._is_http_service(svc):
+                if host_has_tls:
+                    result.findings.append(build_finding(
+                        "HTTP_ONLY",
+                        asset.value, port=port, protocol=svc.protocol,
+                        service=svc.service_name, version=svc.version,
+                        evidence=evidence, source_tool=src,
+                    ))
+                else:
+                    result.findings.append(build_finding(
+                        "HTTPS_MISSING",
+                        asset.value, port=port, protocol=svc.protocol,
+                        service=svc.service_name, version=svc.version,
+                        evidence=evidence, source_tool=src,
+                    ))
+                specific_emitted = True
+
+            # ── 4. Outdated service (banner version heuristic) ───────────────
+            outdated, reason = is_outdated_service(svc.service_name, svc.version)
+            if outdated:
+                result.findings.append(build_finding(
+                    "OUTDATED_SERVICE",
+                    asset.value, port=port, protocol=svc.protocol,
+                    service=svc.service_name, version=svc.version,
+                    evidence=evidence, source_tool=src, reason=reason,
+                ))
+
+            # ── 5. Service version disclosure (any banner-leaking service) ──
+            if svc.version and svc_lower not in _INFO_ONLY_SERVICES:
+                vkey = svc.version.strip().lower()
+                if vkey not in seen_versions:
+                    seen_versions.add(vkey)
+                    result.findings.append(build_finding(
+                        "SERVICE_VERSION_DISCLOSURE",
+                        asset.value, port=port, protocol=svc.protocol,
+                        service=svc.service_name, version=svc.version,
+                        evidence=evidence, source_tool=src,
+                    ))
+
+            # ── 6. Open-port inventory baseline (only if nothing specific) ──
+            if not specific_emitted:
+                result.findings.append(build_finding(
+                    "OPEN_PORT",
+                    asset.value, port=port, protocol=svc.protocol,
+                    service=svc.service_name, version=svc.version,
+                    evidence=evidence, source_tool=src,
+                ))
+
+        # ── 7. Asset-level: end-of-life operating system ─────────────────────
+        eol, reason = is_eol_os(asset.os_name)
+        if eol:
+            # OS detection is a fingerprint guess; scale severity/confidence to
+            # how confident Nmap was. High-confidence match → keep HIGH.
+            conf = asset.os_confidence or "low"
+            severity = "HIGH" if conf == "high" else "MEDIUM"
+            result.findings.append(build_finding(
+                "EOL_OPERATING_SYSTEM",
+                asset.value,
+                version=     asset.os_name,
+                evidence=    f"OS fingerprint: {asset.os_name} (confidence: {conf})",
+                source_tool= src,
+                severity=    severity,
+                confidence=  conf,
+                reason=      reason,
+            ))
+
+    # ── Service-classification helpers ──────────────────────────────────────
+
+    @staticmethod
+    def _is_http_service(svc: ParsedService) -> bool:
+        """True for cleartext HTTP services (not TLS-wrapped)."""
+        name = (svc.service_name or "").lower().strip()
+        if "ssl" in name or "https" in name:
+            return False
+        return name in _HTTP_SERVICES or svc.port in _HTTP_PORTS
+
+    @staticmethod
+    def _is_tls_service(svc: ParsedService) -> bool:
+        """True when the service indicates TLS is available on the host."""
+        name = (svc.service_name or "").lower().strip()
+        if "ssl" in name or "https" in name:
+            return True
+        return name in _TLS_HINT_SERVICES or svc.port in _TLS_PORTS
 
 
 # ---------------------------------------------------------------------------
 # Registration — runs at module import time
-# Mirrors the pattern used by classifiers and extractors.
 # ---------------------------------------------------------------------------
 
 register(NmapParser())

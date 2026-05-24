@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Optional
 
 from intelligence.file_classifier import NmapSubtype, ToolType
+from intelligence.finding_catalog import build_finding, is_short_rsa_key
 from parsers.base import BaseParser, ParsedScanData
 from parsers.models import ParsedAsset, ParsedFinding, ParsedService
 from parsers.registry import register
@@ -172,14 +173,18 @@ _CIPHER_RE = re.compile(
 # Certificate block start marker
 _CERT_BLOCK_RE = re.compile(r"SSL Certificate:", re.IGNORECASE)
 
-# Certificate field lines — parse the block line-by-line after locating the block
-_CERT_SUBJECT_RE  = re.compile(r"Subject:\s+(.+)$",         re.IGNORECASE)
-_CERT_ISSUER_RE   = re.compile(r"Issuer:\s+(.+)$",          re.IGNORECASE)
-_CERT_EXPIRY_RE   = re.compile(r"Not valid after:\s+(.+)$",  re.IGNORECASE)
-_CERT_NOTBEFORE_RE= re.compile(r"Not valid before:\s+(.+)$", re.IGNORECASE)
-_CERT_SELFSIGN_RE = re.compile(r"Self[- ]Signed:\s+(\w+)$",  re.IGNORECASE)
-_CERT_ALG_RE      = re.compile(r"Signature Algorithm:\s+(.+)$", re.IGNORECASE)
-_CERT_KEYSIZE_RE  = re.compile(r"RSA Key Strength:\s+(\d+)", re.IGNORECASE)
+# Certificate field lines — parse the block line-by-line after locating the block.
+# re.MULTILINE is REQUIRED: without it, the trailing `$` only anchors at end of
+# the whole block, so any field that is NOT on the final line silently fails to
+# match (this previously suppressed Subject/Issuer/Self-Signed/key-size parsing
+# whenever the block did not end on that field).
+_CERT_SUBJECT_RE  = re.compile(r"Subject:\s+(.+)$",          re.IGNORECASE | re.MULTILINE)
+_CERT_ISSUER_RE   = re.compile(r"Issuer:\s+(.+)$",           re.IGNORECASE | re.MULTILINE)
+_CERT_EXPIRY_RE   = re.compile(r"Not valid after:\s+(.+)$",  re.IGNORECASE | re.MULTILINE)
+_CERT_NOTBEFORE_RE= re.compile(r"Not valid before:\s+(.+)$", re.IGNORECASE | re.MULTILINE)
+_CERT_SELFSIGN_RE = re.compile(r"Self[- ]Signed:\s+(\w+)",   re.IGNORECASE | re.MULTILINE)
+_CERT_ALG_RE      = re.compile(r"Signature Algorithm:\s+(.+)$", re.IGNORECASE | re.MULTILINE)
+_CERT_KEYSIZE_RE  = re.compile(r"RSA Key Strength:\s+(\d+)",  re.IGNORECASE | re.MULTILINE)
 
 # SSLScan version line: "Version: 2.0.15" or banner "sslscan version 2.0.15"
 _VERSION_RE = re.compile(
@@ -385,33 +390,20 @@ class SslscanParser(BaseParser):
             if is_enabled:
                 if proto_key in _WEAK_PROTOCOLS:
                     severity, label = _WEAK_PROTOCOLS[proto_key]
-                    findings.append(ParsedFinding(
-                        finding_type=  "WEAK_TLS_VERSION",
-                        target=        target,
-                        port=          port,
-                        protocol=      "tcp",
-                        service=       "ssl",
-                        detail=        (
-                            f"Deprecated protocol {label} is accepted by the server. "
-                            f"Clients using this protocol are exposed to known attacks."
-                        ),
-                        severity_hint= severity,
-                        raw_evidence=  m.group(0).strip(),
-                        source_tool=   self.tool_type.value,
+                    findings.append(build_finding(
+                        "WEAK_TLS",
+                        target, port=port, protocol="tcp", service="ssl",
+                        version=label, evidence=m.group(0).strip(),
+                        source_tool=self.tool_type.value, severity=severity,
                     ))
 
                 elif proto_key in _STRONG_PROTOCOLS:
                     label = _STRONG_PROTOCOLS[proto_key]
-                    findings.append(ParsedFinding(
-                        finding_type=  "TLS_ENABLED",
-                        target=        target,
-                        port=          port,
-                        protocol=      "tcp",
-                        service=       "ssl",
-                        detail=        f"Modern protocol {label} is supported.",
-                        severity_hint= "INFO",
-                        raw_evidence=  m.group(0).strip(),
-                        source_tool=   self.tool_type.value,
+                    findings.append(build_finding(
+                        "TLS_ENABLED",
+                        target, port=port, protocol="tcp", service="ssl",
+                        version=label, evidence=m.group(0).strip(),
+                        source_tool=self.tool_type.value,
                     ))
 
         if not inventory:
@@ -467,19 +459,12 @@ class SslscanParser(BaseParser):
             if entry["weak"] and cipher_name not in seen_weak:
                 seen_weak.add(cipher_name)
                 severity = "HIGH" if bits < 128 else "MEDIUM"
-                findings.append(ParsedFinding(
-                    finding_type=  "WEAK_CIPHER",
-                    target=        target,
-                    port=          port,
-                    protocol=      "tcp",
-                    service=       "ssl",
-                    detail=        (
-                        f"Weak cipher suite accepted: {cipher_name} "
-                        f"({tls_version}, {bits} bits)"
-                    ),
-                    severity_hint= severity,
-                    raw_evidence=  m.group(0).strip(),
-                    source_tool=   self.tool_type.value,
+                findings.append(build_finding(
+                    "WEAK_CIPHER",
+                    target, port=port, protocol="tcp", service="ssl",
+                    version=cipher_name,
+                    evidence=m.group(0).strip(),
+                    source_tool=self.tool_type.value, severity=severity,
                 ))
 
         return findings, inventory
@@ -530,23 +515,23 @@ class SslscanParser(BaseParser):
             if m:
                 cert_info[key] = m.group(1).strip()
 
+        # Reporter-facing aliases. The SSL/TLS report block reads cert["key_size"]
+        # and cert["sig_algorithm"]; expose those names too (additive — the
+        # original keys are preserved for any other consumer).
+        if cert_info.get("rsa_key_bits"):
+            cert_info.setdefault("key_size", cert_info["rsa_key_bits"])
+        if cert_info.get("signature_algorithm"):
+            cert_info.setdefault("sig_algorithm", cert_info["signature_algorithm"])
+
         # ── Self-signed detection ─────────────────────────────────────────
         self_signed_raw = cert_info.get("self_signed", "").lower()
         if self_signed_raw in ("true", "yes", "1"):
             cert_info["self_signed"] = True
-            findings.append(ParsedFinding(
-                finding_type=  "SELF_SIGNED_CERT",
-                target=        target,
-                port=          port,
-                protocol=      "tcp",
-                service=       "ssl",
-                detail=        (
-                    "The SSL certificate is self-signed. Clients cannot verify "
-                    "the server's identity, enabling man-in-the-middle attacks."
-                ),
-                severity_hint= "HIGH",
-                raw_evidence=  f"Self Signed: {self_signed_raw}",
-                source_tool=   self.tool_type.value,
+            findings.append(build_finding(
+                "SELF_SIGNED_CERT",
+                target, port=port, protocol="tcp", service="ssl",
+                evidence=f"Self Signed: {self_signed_raw}",
+                source_tool=self.tool_type.value,
             ))
         else:
             # Normalize to boolean False for non-self-signed certificates
@@ -560,22 +545,31 @@ class SslscanParser(BaseParser):
             iss  = cert_info["issuer"].lower()
             if subj == iss and "SELF_SIGNED_CERT" not in {f.finding_type for f in findings}:
                 cert_info["self_signed"] = True
-                findings.append(ParsedFinding(
-                    finding_type=  "SELF_SIGNED_CERT",
-                    target=        target,
-                    port=          port,
-                    protocol=      "tcp",
-                    service=       "ssl",
-                    detail=        (
-                        "Certificate Subject equals Issuer — likely self-signed. "
-                        "Clients cannot verify the server identity."
-                    ),
-                    severity_hint= "HIGH",
-                    raw_evidence=  (
-                        f"Subject: {cert_info['subject']}\n"
-                        f"Issuer:  {cert_info['issuer']}"
-                    ),
-                    source_tool=   self.tool_type.value,
+                findings.append(build_finding(
+                    "SELF_SIGNED_CERT",
+                    target, port=port, protocol="tcp", service="ssl",
+                    evidence=(f"Subject: {cert_info['subject']} | "
+                              f"Issuer: {cert_info['issuer']} (Subject equals Issuer)"),
+                    source_tool=self.tool_type.value,
+                ))
+
+        # ── Short RSA key detection ───────────────────────────────────────
+        # Conservative: only RSA keys, only when a numeric strength was parsed.
+        bits_raw = cert_info.get("rsa_key_bits")
+        if bits_raw:
+            try:
+                bits = int(bits_raw)
+            except (TypeError, ValueError):
+                bits = 0
+            is_short, _reason = is_short_rsa_key(bits)
+            if is_short:
+                severity = "HIGH" if bits < 1024 else "MEDIUM"
+                findings.append(build_finding(
+                    "SHORT_KEY_LENGTH",
+                    target, port=port, protocol="tcp", service="ssl",
+                    version=f"{bits}-bit RSA",
+                    evidence=f"RSA Key Strength: {bits}",
+                    source_tool=self.tool_type.value, severity=severity,
                 ))
 
         # ── Expiry detection ──────────────────────────────────────────────
@@ -589,20 +583,12 @@ class SslscanParser(BaseParser):
                 if expiry_dt.tzinfo is None:
                     expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
                 if expiry_dt < now:
-                    findings.append(ParsedFinding(
-                        finding_type=  "EXPIRED_CERT",
-                        target=        target,
-                        port=          port,
-                        protocol=      "tcp",
-                        service=       "ssl",
-                        detail=        (
-                            f"The SSL certificate expired on {expiry_str}. "
-                            "Expired certificates cause browser warnings and "
-                            "may indicate neglected certificate lifecycle management."
-                        ),
-                        severity_hint= "CRITICAL",
-                        raw_evidence=  f"Not valid after: {expiry_str}",
-                        source_tool=   self.tool_type.value,
+                    findings.append(build_finding(
+                        "EXPIRED_CERT",
+                        target, port=port, protocol="tcp", service="ssl",
+                        version=f"expired {expiry_str}",
+                        evidence=f"Not valid after: {expiry_str}",
+                        source_tool=self.tool_type.value,
                     ))
 
         return cert_info, findings
